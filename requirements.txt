@@ -1,0 +1,2 @@
+# AstrBot 本体已内置 apscheduler（telegram 适配器依赖），此处仅作显式声明
+apscheduler>=3.10.0
