@@ -743,32 +743,39 @@ class OfficialBroadcastPlugin(Star):
         return result
 
     async def _db_sessions(self) -> list[tuple[str, str]]:
-        """从 AstrBot 数据库读取已知 UMO（与 WebUI 会话列表同源）。"""
+        """从 AstrBot 数据库读取已知 UMO（与 WebUI 会话列表同源）。
+
+        三张表分别查询：旧版本可能还没有 umo_aliases，单表缺失不应
+        影响其它来源。
+        """
         if not SQLALCHEMY_AVAILABLE:
             return []
-        db = None
         try:
             db = self.context.get_db()
         except Exception:
             return []
         if db is None:
             return []
-        try:
-            async with db.get_db() as session:
-                result = await session.execute(
-                    sql_text(
-                        "SELECT umo FROM ("
-                        " SELECT user_id AS umo FROM conversations"
-                        " UNION ALL SELECT umo FROM umo_senders"
-                        " UNION ALL SELECT umo FROM umo_aliases"
-                        ") WHERE umo IS NOT NULL AND umo != ''"
-                        f" GROUP BY umo LIMIT {DB_UMO_LIMIT}"
-                    )
-                )
-                umos = [str(row[0]) for row in result.fetchall()]
-        except Exception as exc:
-            logger.debug(f"[broadcast] 读取数据库会话失败：{exc}")
-            return []
+
+        queries = (
+            "SELECT DISTINCT user_id FROM conversations "
+            "WHERE user_id IS NOT NULL AND user_id != ''",
+            "SELECT DISTINCT umo FROM umo_senders WHERE umo IS NOT NULL AND umo != ''",
+            "SELECT DISTINCT umo FROM umo_aliases WHERE umo IS NOT NULL AND umo != ''",
+        )
+        seen: dict[str, None] = {}
+        for sql in queries:
+            try:
+                async with db.get_db() as session:
+                    result = await session.execute(sql_text(sql))
+                    for row in result.fetchall():
+                        umo = str(row[0])
+                        if umo:
+                            seen.setdefault(umo, None)
+            except Exception as exc:
+                logger.debug(f"[broadcast] 查询会话来源失败：{exc}")
+            if len(seen) >= DB_UMO_LIMIT:
+                break
 
         names: dict[str, str] = {}
         try:
@@ -786,6 +793,7 @@ class OfficialBroadcastPlugin(Star):
         except Exception:
             pass
 
+        umos = list(seen)[:DB_UMO_LIMIT]
         return [(umo, names.get(umo, "")) for umo in umos]
 
     def _aiocqhttp_instances(self) -> list[tuple[str, Any]]:
