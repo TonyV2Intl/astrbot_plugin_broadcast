@@ -1,10 +1,18 @@
 name: astrbot_plugin_broadcast
-display_name: 全群广播（QQ 官方）
-desc: 面向 QQ 官方机器人的全群广播插件，支持管理员指令、避开名单、Cron 定时广播、发送间隔与每日额度保护。
-short_desc: 全群广播 / 定时广播 / 避开名单 / 限速防封
-version: 1.0.0
+display_name: 全群广播
+desc: 向多个会话广播消息的 AstrBot 插件，带独立可视化配置台、定时任务、目标白名单与发送限速。
+short_desc: 全群广播 + 可视化配置台 + 定时发送
+version: 2.0.0
 author: TonyV2Intl
 repo: https://github.com/TonyV2Intl/astrbot_plugin_broadcast
+astrbot_version: ">=4.24.2"
 support_platforms:
   - qq_official
+  - qq_official_webhook
   - aiocqhttp
+  - telegram
+  - discord
+  - slack
+  - kook
+  - wecom
+  - lark

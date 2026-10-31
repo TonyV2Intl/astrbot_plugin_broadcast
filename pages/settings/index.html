@@ -1,0 +1,787 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>广播配置</title>
+    <style>
+      :root {
+        --bg: #f5f6f8;
+        --card: #ffffff;
+        --text: #1f2329;
+        --muted: #6b7280;
+        --border: #e4e7ec;
+        --border-strong: #d0d5dd;
+        --primary: #2f6fed;
+        --primary-soft: rgba(47, 111, 237, 0.1);
+        --danger: #d92d20;
+        --danger-soft: rgba(217, 45, 32, 0.08);
+        --ok: #079455;
+        --ok-soft: rgba(7, 148, 85, 0.1);
+        --warn: #b54708;
+        --warn-soft: rgba(181, 71, 8, 0.1);
+        --shadow: 0 1px 2px rgba(16, 24, 40, 0.05), 0 1px 3px rgba(16, 24, 40, 0.06);
+        --radius: 12px;
+      }
+
+      html[data-theme="dark"] {
+        --bg: #16181d;
+        --card: #1f2229;
+        --text: #e6e8eb;
+        --muted: #98a2b3;
+        --border: #2c313a;
+        --border-strong: #3a4150;
+        --primary: #6a9bff;
+        --primary-soft: rgba(106, 155, 255, 0.14);
+        --danger: #ff7b72;
+        --danger-soft: rgba(255, 123, 114, 0.12);
+        --ok: #3ddc97;
+        --ok-soft: rgba(61, 220, 151, 0.12);
+        --warn: #f7b955;
+        --warn-soft: rgba(247, 185, 85, 0.12);
+        --shadow: none;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        padding: 20px 16px 96px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .wrap {
+        max-width: 1080px;
+        margin: 0 auto;
+      }
+
+      header.top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 16px;
+        flex-wrap: wrap;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 650;
+        letter-spacing: 0.2px;
+      }
+
+      .subtitle {
+        margin: 2px 0 0;
+        color: var(--muted);
+        font-size: 12.5px;
+      }
+
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        padding: 18px;
+        margin-bottom: 16px;
+      }
+
+      .card h2 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        font-weight: 650;
+      }
+
+      .card .desc {
+        margin: 0 0 14px;
+        color: var(--muted);
+        font-size: 12.5px;
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 12px;
+      }
+
+      .stat {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 12px 14px;
+        background: linear-gradient(180deg, var(--card), var(--bg));
+      }
+
+      .stat .label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .stat .value {
+        font-size: 22px;
+        font-weight: 650;
+        margin-top: 2px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+
+      .stat .value small {
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--muted);
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 14px 18px;
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .field > label {
+        font-size: 12.5px;
+        font-weight: 600;
+        color: var(--text);
+      }
+
+      .field .hint {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      input[type="text"],
+      input[type="number"],
+      input[type="time"],
+      select,
+      textarea {
+        width: 100%;
+        border: 1px solid var(--border-strong);
+        background: var(--card);
+        color: var(--text);
+        border-radius: 8px;
+        padding: 8px 10px;
+        font: inherit;
+        outline: none;
+        transition: border-color 0.15s, box-shadow 0.15s;
+      }
+
+      input:focus,
+      select:focus,
+      textarea:focus {
+        border-color: var(--primary);
+        box-shadow: 0 0 0 3px var(--primary-soft);
+      }
+
+      textarea {
+        resize: vertical;
+        min-height: 84px;
+      }
+
+      input[type="time"] {
+        max-width: 160px;
+      }
+
+      .switch {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .switch input {
+        appearance: none;
+        width: 38px;
+        height: 22px;
+        border-radius: 999px;
+        background: var(--border-strong);
+        position: relative;
+        cursor: pointer;
+        transition: background 0.18s;
+        flex: none;
+      }
+
+      .switch input::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: #fff;
+        transition: transform 0.18s;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+      }
+
+      .switch input:checked {
+        background: var(--primary);
+      }
+
+      .switch input:checked::after {
+        transform: translateX(16px);
+      }
+
+      .seg {
+        display: inline-flex;
+        align-self: flex-start;
+        border: 1px solid var(--border-strong);
+        border-radius: 9px;
+        overflow: hidden;
+        background: var(--card);
+      }
+
+      .seg button {
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        padding: 7px 16px;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .seg button + button {
+        border-left: 1px solid var(--border);
+      }
+
+      .seg button.active {
+        background: var(--primary-soft);
+        color: var(--primary);
+        font-weight: 600;
+      }
+
+      .weekdays {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .weekdays button {
+        border: 1px solid var(--border-strong);
+        background: var(--card);
+        color: var(--muted);
+        border-radius: 8px;
+        padding: 6px 12px;
+        font: inherit;
+        cursor: pointer;
+        min-width: 52px;
+      }
+
+      .weekdays button.active {
+        border-color: var(--primary);
+        color: var(--primary);
+        background: var(--primary-soft);
+        font-weight: 600;
+      }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+
+      .toolbar .grow {
+        flex: 1 1 200px;
+        min-width: 160px;
+      }
+
+      .toolbar select {
+        width: auto;
+        min-width: 128px;
+      }
+
+      .btn {
+        border: 1px solid var(--border-strong);
+        background: var(--card);
+        color: var(--text);
+        border-radius: 8px;
+        padding: 7px 13px;
+        font: inherit;
+        cursor: pointer;
+        white-space: nowrap;
+        transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+      }
+
+      .btn:hover:not(:disabled) {
+        border-color: var(--primary);
+        color: var(--primary);
+      }
+
+      .btn.primary {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: #fff;
+        font-weight: 600;
+      }
+
+      .btn.primary:hover:not(:disabled) {
+        opacity: 0.9;
+        color: #fff;
+      }
+
+      .btn:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      .status-tabs {
+        display: inline-flex;
+        gap: 4px;
+        padding: 3px;
+        border-radius: 9px;
+        background: var(--bg);
+        border: 1px solid var(--border);
+      }
+
+      .status-tabs button {
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        border-radius: 6px;
+        padding: 5px 11px;
+        font: inherit;
+        cursor: pointer;
+        font-size: 12.5px;
+      }
+
+      .status-tabs button.active {
+        background: var(--card);
+        color: var(--text);
+        font-weight: 600;
+        box-shadow: var(--shadow);
+      }
+
+      .banner {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        padding: 10px 12px;
+        font-size: 12.5px;
+        margin-bottom: 12px;
+        background: var(--bg);
+        color: var(--muted);
+      }
+
+      .banner strong {
+        color: var(--text);
+        font-weight: 600;
+      }
+
+      .banner.warn {
+        background: var(--warn-soft);
+        border-color: transparent;
+        color: var(--warn);
+      }
+
+      .banner.ok {
+        background: var(--ok-soft);
+        border-color: transparent;
+        color: var(--ok);
+      }
+
+      .session-list {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        overflow: hidden;
+        max-height: 460px;
+        overflow-y: auto;
+      }
+
+      .session-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--border);
+        cursor: pointer;
+        transition: background 0.12s;
+      }
+
+      .session-row:last-child {
+        border-bottom: 0;
+      }
+
+      .session-row:hover {
+        background: var(--bg);
+      }
+
+      .session-row.excluded {
+        opacity: 0.62;
+        background: var(--danger-soft);
+      }
+
+      .session-row input[type="checkbox"] {
+        width: 16px;
+        height: 16px;
+        accent-color: var(--primary);
+        cursor: pointer;
+        flex: none;
+      }
+
+      .session-row .main {
+        min-width: 0;
+        flex: 1;
+      }
+
+      .session-row .name {
+        font-weight: 550;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .session-row.excluded .name {
+        text-decoration: line-through;
+      }
+
+      .session-row .umo {
+        display: block;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11.5px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .badge {
+        display: inline-block;
+        font-size: 11px;
+        line-height: 18px;
+        padding: 0 8px;
+        border-radius: 999px;
+        border: 1px solid var(--border-strong);
+        color: var(--muted);
+        background: var(--card);
+        white-space: nowrap;
+        flex: none;
+      }
+
+      .badge.group {
+        color: var(--primary);
+        border-color: transparent;
+        background: var(--primary-soft);
+      }
+
+      .badge.private {
+        color: var(--ok);
+        border-color: transparent;
+        background: var(--ok-soft);
+      }
+
+      .icon-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--muted);
+        border-radius: 7px;
+        width: 30px;
+        height: 28px;
+        cursor: pointer;
+        font-size: 14px;
+        flex: none;
+        line-height: 1;
+      }
+
+      .icon-btn:hover {
+        background: var(--danger-soft);
+        color: var(--danger);
+        border-color: transparent;
+      }
+
+      .session-row.excluded .icon-btn {
+        color: var(--danger);
+      }
+
+      .list-foot {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+        font-size: 12.5px;
+        color: var(--muted);
+        flex-wrap: wrap;
+      }
+
+      .empty {
+        padding: 32px 16px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .savebar {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: color-mix(in srgb, var(--card) 88%, transparent);
+        backdrop-filter: blur(8px);
+        border-top: 1px solid var(--border);
+        padding: 12px 16px;
+        z-index: 30;
+      }
+
+      .savebar .inner {
+        max-width: 1080px;
+        margin: 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .savebar .summary {
+        font-size: 12.5px;
+        color: var(--muted);
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toast {
+        position: fixed;
+        left: 50%;
+        top: 18px;
+        transform: translate(-50%, -16px);
+        background: var(--text);
+        color: var(--card);
+        padding: 9px 16px;
+        border-radius: 9px;
+        font-size: 13px;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s, transform 0.2s;
+        z-index: 60;
+        max-width: min(560px, calc(100vw - 32px));
+      }
+
+      .toast.show {
+        opacity: 1;
+        transform: translate(-50%, 0);
+      }
+
+      .toast.error {
+        background: var(--danger);
+        color: #fff;
+      }
+
+      .loading {
+        padding: 40px;
+        text-align: center;
+        color: var(--muted);
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      @media (max-width: 640px) {
+        .badge.platform {
+          display: none;
+        }
+        body {
+          padding: 14px 10px 92px;
+        }
+        .card {
+          padding: 14px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="top">
+        <div>
+          <h1>广播配置</h1>
+          <p class="subtitle">目标会话、定时计划与发送节奏都在这里集中管理</p>
+        </div>
+        <label class="switch" title="插件总开关">
+          <input type="checkbox" id="enabled" />
+          <span id="enabled-label">已启用</span>
+        </label>
+      </header>
+
+      <div id="loading" class="loading">正在连接 AstrBot…</div>
+
+      <div id="content" class="hidden">
+        <section class="card">
+          <div class="stats">
+            <div class="stat">
+              <div class="label">已知会话</div>
+              <div class="value" id="stat-total">—</div>
+            </div>
+            <div class="stat">
+              <div class="label">本次广播目标</div>
+              <div class="value" id="stat-target">—</div>
+            </div>
+            <div class="stat">
+              <div class="label">今日已发送</div>
+              <div class="value" id="stat-quota">—</div>
+            </div>
+            <div class="stat">
+              <div class="label">下次定时</div>
+              <div class="value" id="stat-next" style="font-size: 14px; padding-top: 6px">—</div>
+            </div>
+          </div>
+          <div id="runtime-banner" class="banner hidden"></div>
+        </section>
+
+        <section class="card">
+          <h2>基础设置</h2>
+          <p class="desc">管理员权限、发送节奏与每日额度保护。</p>
+          <div class="grid">
+            <div class="field">
+              <label for="admin-uids">管理员 UID</label>
+              <input type="text" id="admin-uids" placeholder="多个用逗号分隔" />
+              <span class="hint"
+                >留空时回退到 AstrBot 全局管理员。QQ 官方机器人在群里的 UID
+                是 member_openid，不是 QQ 号。</span
+              >
+            </div>
+            <div class="field">
+              <label for="send-interval">每个会话发送间隔（秒）</label>
+              <input type="number" id="send-interval" min="0" max="60" step="0.5" />
+              <span class="hint">默认 2 秒，用于规避平台频率限制。</span>
+            </div>
+            <div class="field">
+              <label for="max-per-minute">每分钟最多发送（条）</label>
+              <input type="number" id="max-per-minute" min="0" max="60" step="1" />
+              <span class="hint">0 表示不限制；QQ 官方建议 20。</span>
+            </div>
+            <div class="field">
+              <label for="daily-limit">每日额度上限（条）</label>
+              <input type="number" id="daily-limit" min="0" step="10" />
+              <span class="hint">0 表示不限制；QQ 官方主动消息约 1000 条/天。</span>
+            </div>
+            <div class="field">
+              <label for="timezone">时区</label>
+              <input type="text" id="timezone" placeholder="Asia/Shanghai" />
+              <span class="hint">定时任务按此时区计算，例如 Asia/Shanghai。</span>
+            </div>
+            <div class="field">
+              <label>自动登记会话</label>
+              <label class="switch">
+                <input type="checkbox" id="auto-register" />
+                <span id="auto-register-label">开启</span>
+              </label>
+              <span class="hint">机器人收到消息时自动记录该会话，便于后续广播。</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>定时广播</h2>
+          <p class="desc">可视化选择时间，保存后立即重建定时任务，无需重启 AstrBot。</p>
+          <div class="grid">
+            <div class="field">
+              <label>启用定时广播</label>
+              <label class="switch">
+                <input type="checkbox" id="enable-schedule" />
+                <span id="enable-schedule-label">关闭</span>
+              </label>
+            </div>
+            <div class="field">
+              <label>重复方式</label>
+              <div class="seg" id="schedule-mode">
+                <button type="button" data-mode="daily">每天</button>
+                <button type="button" data-mode="weekly">每周</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="schedule-time">发送时间</label>
+              <input type="time" id="schedule-time" step="60" />
+            </div>
+          </div>
+          <div class="field hidden" id="weekday-field" style="margin-top: 14px">
+            <label>选择星期</label>
+            <div class="weekdays" id="weekdays"></div>
+          </div>
+          <div class="field" style="margin-top: 14px">
+            <label for="schedule-message">定时消息内容</label>
+            <textarea
+              id="schedule-message"
+              maxlength="4000"
+              placeholder="例如：早安，今天的例行维护安排在 20:00，请提前保存工作。"
+            ></textarea>
+            <span class="hint" id="schedule-preview">—</span>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>目标会话</h2>
+          <p class="desc">
+            勾选表示只向选中的会话广播；一个都不勾时向全部会话广播（排除名单除外）。
+          </p>
+
+          <div id="mode-banner" class="banner"></div>
+
+          <div class="toolbar">
+            <div class="grow">
+              <input type="text" id="search" placeholder="搜索群名、会话 ID 或 UMO" />
+            </div>
+            <select id="filter-platform">
+              <option value="">全部平台</option>
+            </select>
+            <select id="filter-type">
+              <option value="">全部场景</option>
+            </select>
+            <div class="status-tabs" id="status-tabs">
+              <button type="button" data-status="all" class="active">全部</button>
+              <button type="button" data-status="selected">已选</button>
+              <button type="button" data-status="unselected">未选</button>
+              <button type="button" data-status="excluded">已排除</button>
+            </div>
+          </div>
+
+          <div class="toolbar">
+            <button type="button" class="btn" id="select-all">全选当前筛选</button>
+            <button type="button" class="btn" id="clear-all">清空选择</button>
+            <button type="button" class="btn" id="refresh-sessions">刷新会话列表</button>
+            <span class="hint" id="refresh-hint"></span>
+          </div>
+
+          <div class="session-list" id="session-list"></div>
+          <div class="list-foot">
+            <span id="list-count">—</span>
+            <span>行尾按钮可切换“永不发送”，排除的会话不参与任何广播</span>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>运行信息</h2>
+          <p class="desc">上次广播结果与依赖状态。</p>
+          <div id="last-result" class="banner">暂无广播记录。</div>
+        </section>
+      </div>
+    </div>
+
+    <div class="savebar">
+      <div class="inner">
+        <div class="summary" id="save-summary">—</div>
+        <button type="button" class="btn primary" id="save">保存配置</button>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

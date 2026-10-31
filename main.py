@@ -1,20 +1,26 @@
-"""AstrBot 全群广播插件。
+"""AstrBot 全群广播插件（独立可视化配置台版）。
 
-命令：
-    /broadcast <消息内容>                        向所有已登记群聊广播
-    /broadcast_list                              查看已登记的群聊
-    /broadcast_add <平台ID>:GroupMessage:<群号>   手动登记一个群
-    /broadcast_remove <平台ID>:GroupMessage:<群号> 移除一个群
-    /broadcast_status                            查看额度、限速与定时任务状态
-    /broadcast_reload                            按当前配置重建定时任务
+架构说明：
+    v2 起配置不再堆在 ``_conf_schema.json`` 里，而是由插件自带的
+    Pages 页面（``pages/settings/``）管理，数据落在
+    ``data/plugin_data/astrbot_plugin_broadcast/settings.json``。
+    ``_conf_schema.json`` 只保留一个全局启用开关。
+
+指令：
+    /broadcast <消息内容>   向目标会话广播（管理员）
+    /broadcast_status       查看运行状态
+    /broadcast_list         查看已发现的会话
+    /broadcast_reload       重载配置并重建定时任务
 
 说明：
-    群列表采用“动态登记 + 本地持久化”的方式维护，登记时统一使用 AstrBot 的
-    规范化 UMO：<平台ID>:GroupMessage:<群号>，不按平台做任何推断。
-      1. 机器人收到任意群消息时，自动记录该群的 UMO；
-      2. 挂了 aiocqhttp（NapCat / Lagrange 等）时，可在插件配置里打开
-         「立即同步群列表」并保存，插件会调用 get_group_list 拉取全量群；
-      3. 也可以通过 /broadcast_add 手动登记。
+    广播目标不再局限于群聊。插件会综合三处来源发现会话：
+      1. 插件自身记录过的 UMO（收到过消息即记录）；
+      2. 平台适配器内存中的会话缓存（如 QQ 官方的 scene 缓存）；
+      3. AstrBot 数据库中的已知 UMO（conversations / umo_senders /
+         umo_aliases，与 WebUI 会话列表同源）。
+    QQ 官方开放平台没有“查询已加入群列表”的接口，因此仍无法凭空
+    枚举全部群；挂载 aiocqhttp 时可在页面上点“刷新会话”调用
+    ``get_group_list`` 补全。
 """
 
 from __future__ import annotations
@@ -25,297 +31,1349 @@ import os
 import re
 import time
 from collections import deque
-from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
-try:  # Python 3.9+
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover
-    ZoneInfo = None  # type: ignore[assignment]
+try:  # AstrBot >= 4.24.2 提供的插件 Web API 工具
+    from astrbot.api import web as _web
 
-try:  # AstrBot 自带 apscheduler（telegram 适配器依赖它）
+    WEB_API_AVAILABLE = True
+except Exception:  # pragma: no cover - 旧版本降级
+    _web = None  # type: ignore[assignment]
+    WEB_API_AVAILABLE = False
+
+try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
-except ImportError:  # pragma: no cover
+
+    SCHEDULER_AVAILABLE = True
+except Exception:  # pragma: no cover - 未安装依赖
     AsyncIOScheduler = None  # type: ignore[assignment]
     CronTrigger = None  # type: ignore[assignment]
+    SCHEDULER_AVAILABLE = False
+
+try:
+    from sqlalchemy import text as sql_text
+
+    SQLALCHEMY_AVAILABLE = True
+except Exception:  # pragma: no cover - 未安装依赖
+    sql_text = None  # type: ignore[assignment]
+    SQLALCHEMY_AVAILABLE = False
+
 
 PLUGIN_NAME = "astrbot_plugin_broadcast"
 SCHEDULE_JOB_ID = "broadcast_cron"
 GROUP_MESSAGE_TYPE = "GroupMessage"
 
 DEFAULT_INTERVAL = 2.0
-DEFAULT_DAILY_LIMIT = 1000
 DEFAULT_MAX_PER_MINUTE = 20
-DEFAULT_TIMEOUT = 20
+DEFAULT_DAILY_LIMIT = 1000
 DEFAULT_TIMEZONE = "Asia/Shanghai"
-DEFAULT_CRON = "0 9 * * *"
-SYNC_WAIT_SECONDS = 15
+DEFAULT_TIME = "09:00"
+DEFAULT_WEEKDAYS = [0, 1, 2, 3, 4, 5, 6]
+
+MAX_INTERVAL = 60.0
+MAX_MESSAGE_LENGTH = 4000
+REGISTRY_FLUSH_DELAY = 5.0
+DB_UMO_LIMIT = 5000
+
+#: 这些平台不是真正的 IM 会话，广播时应忽略。
+NON_BROADCAST_PLATFORMS = {"webchat", "unknown", ""}
+
+WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+_UMO_RE = re.compile(r"^[^:\s]+:[^:\s]+:.+$")
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+class SettingsError(ValueError):
+    """配置校验失败，消息可直接展示给用户。"""
 
 
 # --------------------------------------------------------------------------- #
-# 限速器
-# --------------------------------------------------------------------------- #
-class RateLimiter:
-    """滑动窗口限速器，用于把发送速率压到 N 条/分钟以内。"""
-
-    def __init__(self, max_per_minute: int) -> None:
-        self.max_per_minute = max(0, int(max_per_minute))
-        self._timestamps: deque[float] = deque()
-
-    async def acquire(self) -> None:
-        """在允许发送时立即返回，否则等到窗口空出位置。"""
-        if self.max_per_minute <= 0:
-            return
-        while True:
-            now = time.monotonic()
-            while self._timestamps and now - self._timestamps[0] >= 60.0:
-                self._timestamps.popleft()
-            if len(self._timestamps) < self.max_per_minute:
-                self._timestamps.append(now)
-                return
-            wait = 60.0 - (now - self._timestamps[0]) + 0.05
-            await asyncio.sleep(max(wait, 0.05))
-
-
-# --------------------------------------------------------------------------- #
-# 数据结构
+# 配置模型
 # --------------------------------------------------------------------------- #
 @dataclass
-class BroadcastResult:
-    """一次广播的结果统计。"""
+class ScheduleSettings:
+    """定时广播的可视化配置（由后端编译成 Cron）。"""
 
-    total: int = 0
-    success: int = 0
-    failures: list[tuple[str, str]] = field(default_factory=list)
-    skipped: list[str] = field(default_factory=list)
-    quota_blocked: bool = False
-    elapsed: float = 0.0
+    mode: str = "daily"  # daily | weekly
+    time: str = DEFAULT_TIME
+    weekdays: list[int] = field(default_factory=lambda: list(DEFAULT_WEEKDAYS))
 
+    def to_cron(self) -> str:
+        hour, minute = self.time.split(":")
+        if self.mode == "weekly":
+            days = sorted({d for d in self.weekdays if 0 <= d <= 6})
+            if not days:
+                raise SettingsError("每周模式至少要选择一天")
+            day_of_week = ",".join(str(d) for d in days)
+        else:
+            day_of_week = "*"
+        return f"{int(minute)} {int(hour)} * * {day_of_week}"
 
-@dataclass
-class GroupRecord:
-    """一个广播目标群。"""
+    def describe(self) -> str:
+        if self.mode == "weekly":
+            days = "、".join(WEEKDAY_LABELS[d] for d in sorted(set(self.weekdays)))
+            return f"每周 {days} {self.time}"
+        return f"每天 {self.time}"
 
-    umo: str
-    platform_id: str = ""
-    group_id: str = ""
-    name: str = ""
-    last_seen: float = 0.0
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "time": self.time,
+            "weekdays": list(self.weekdays),
+        }
 
     @classmethod
-    def from_umo(cls, umo: str, name: str = "") -> GroupRecord:
-        parts = umo.split(":", 2)
-        if len(parts) == 3:
-            return cls(
-                umo=umo,
-                platform_id=parts[0],
-                group_id=parts[2],
-                name=name,
-                last_seen=time.time(),
+    def from_dict(cls, raw: Any, base: "ScheduleSettings | None" = None):
+        base = base or cls()
+        if raw is None:
+            return base
+        if not isinstance(raw, dict):
+            raise SettingsError("schedule 必须是对象")
+        mode = str(raw.get("mode", base.mode) or base.mode).strip().lower()
+        if mode not in {"daily", "weekly"}:
+            raise SettingsError("定时模式只支持 daily 或 weekly")
+        time_str = str(raw.get("time", base.time) or base.time).strip()
+        if not _TIME_RE.match(time_str):
+            raise SettingsError(f"时间格式无效：{time_str}（应为 HH:MM）")
+        raw_days = raw.get("weekdays", base.weekdays)
+        days: list[int] = []
+        if isinstance(raw_days, list):
+            for item in raw_days:
+                try:
+                    day = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= day <= 6 and day not in days:
+                    days.append(day)
+        days.sort()
+        if mode == "weekly" and not days:
+            raise SettingsError("每周模式至少要选择一天")
+        return cls(mode=mode, time=time_str, weekdays=days or list(DEFAULT_WEEKDAYS))
+
+
+@dataclass
+class Settings:
+    """插件运行配置（持久化到 settings.json）。"""
+
+    admin_uids: list[str] = field(default_factory=list)
+    target_umos: list[str] = field(default_factory=list)
+    exclude_umos: list[str] = field(default_factory=list)
+    send_interval: float = DEFAULT_INTERVAL
+    max_per_minute: int = DEFAULT_MAX_PER_MINUTE
+    daily_limit: int = DEFAULT_DAILY_LIMIT
+    enable_schedule: bool = False
+    schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
+    schedule_message: str = ""
+    timezone: str = DEFAULT_TIMEZONE
+    auto_register: bool = True
+
+    # -- 序列化 ---------------------------------------------------------- #
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "admin_uids": list(self.admin_uids),
+            "target_umos": list(self.target_umos),
+            "exclude_umos": list(self.exclude_umos),
+            "send_interval": self.send_interval,
+            "max_per_minute": self.max_per_minute,
+            "daily_limit": self.daily_limit,
+            "enable_schedule": self.enable_schedule,
+            "schedule": self.schedule.to_dict(),
+            "schedule_message": self.schedule_message,
+            "timezone": self.timezone,
+            "auto_register": self.auto_register,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any, base: "Settings | None" = None) -> "Settings":
+        base = base or cls()
+        if not isinstance(raw, dict):
+            raise SettingsError("配置必须是 JSON 对象")
+
+        admin_uids = _parse_str_list(raw.get("admin_uids", base.admin_uids))
+        target = _parse_umo_list(
+            raw.get("target_umos", base.target_umos), "target_umos"
+        )
+        exclude = _parse_umo_list(
+            raw.get("exclude_umos", base.exclude_umos), "exclude_umos"
+        )
+
+        interval = _parse_float(
+            raw.get("send_interval", base.send_interval), "发送间隔"
+        )
+        if interval < 0 or interval > MAX_INTERVAL:
+            raise SettingsError(f"发送间隔需在 0~{MAX_INTERVAL:g} 秒之间")
+
+        max_per_minute = _parse_int(
+            raw.get("max_per_minute", base.max_per_minute), "每分钟上限"
+        )
+        if max_per_minute < 0 or max_per_minute > 60:
+            raise SettingsError("每分钟上限需在 0~60 之间（0 表示不限）")
+
+        daily_limit = _parse_int(raw.get("daily_limit", base.daily_limit), "每日额度")
+        if daily_limit < 0 or daily_limit > 1_000_000:
+            raise SettingsError("每日额度需在 0~1000000 之间（0 表示不限）")
+
+        message = str(raw.get("schedule_message", base.schedule_message) or "")
+        if len(message) > MAX_MESSAGE_LENGTH:
+            raise SettingsError(f"定时消息不能超过 {MAX_MESSAGE_LENGTH} 字")
+
+        timezone = str(raw.get("timezone", base.timezone) or DEFAULT_TIMEZONE).strip()
+        if not _valid_timezone(timezone):
+            raise SettingsError(f"时区无效：{timezone}")
+
+        schedule = ScheduleSettings.from_dict(
+            raw.get("schedule", base.schedule.to_dict()), base.schedule
+        )
+
+        return cls(
+            admin_uids=admin_uids,
+            target_umos=target,
+            exclude_umos=exclude,
+            send_interval=round(interval, 2),
+            max_per_minute=max_per_minute,
+            daily_limit=daily_limit,
+            enable_schedule=bool(raw.get("enable_schedule", base.enable_schedule)),
+            schedule=schedule,
+            schedule_message=message,
+            timezone=timezone,
+            auto_register=bool(raw.get("auto_register", base.auto_register)),
+        )
+
+    def replace(self, **kwargs: Any) -> "Settings":
+        data = self.to_dict()
+        for key, value in kwargs.items():
+            if key == "schedule" and isinstance(value, ScheduleSettings):
+                data["schedule"] = value.to_dict()
+            else:
+                data[key] = value
+        return Settings.from_dict(data)
+
+
+def _parse_str_list(raw: Any) -> list[str]:
+    items: list[str] = []
+    if isinstance(raw, str):
+        raw = re.split(r"[\s,，;；]+", raw)
+    if not isinstance(raw, list):
+        return items
+    for item in raw:
+        value = str(item or "").strip()
+        if value and value not in items:
+            items.append(value)
+    return items
+
+
+def _parse_umo_list(raw: Any, field_name: str) -> list[str]:
+    items: list[str] = []
+    if isinstance(raw, str):
+        raw = [line.strip() for line in raw.splitlines()]
+    if not isinstance(raw, list):
+        return items
+    for item in raw:
+        value = str(item or "").strip()
+        if not value:
+            continue
+        if not _UMO_RE.match(value):
+            raise SettingsError(
+                f"{field_name} 中的「{value}」不是合法 UMO，"
+                "应形如 平台ID:GroupMessage:会话ID"
             )
-        return cls(umo=umo, name=name, last_seen=time.time())
+        if value not in items:
+            items.append(value)
+    return items
+
+
+def _parse_float(raw: Any, label: str) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(f"{label}必须是数字") from exc
+
+
+def _parse_int(raw: Any, label: str) -> int:
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(f"{label}必须是整数") from exc
+
+
+def _valid_timezone(name: str) -> bool:
+    try:
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# 会话与广播结果
+# --------------------------------------------------------------------------- #
+@dataclass
+class SessionInfo:
+    """一个可广播的会话。"""
+
+    umo: str
+    platform: str
+    message_type: str
+    session_id: str
+    display_name: str = ""
+    adapter: str = ""
+    sources: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "umo": self.umo,
-            "platform_id": self.platform_id,
-            "group_id": self.group_id,
-            "name": self.name,
-            "last_seen": self.last_seen,
+            "platform": self.platform,
+            "adapter": self.adapter or self.platform,
+            "message_type": self.message_type,
+            "session_id": self.session_id,
+            "display_name": self.display_name or self.session_id,
+            "sources": list(self.sources),
         }
+
+
+@dataclass
+class BroadcastResult:
+    """一次广播的统计结果。"""
+
+    total: int = 0
+    success: int = 0
+    failed: int = 0
+    skipped: int = 0
+    duration: float = 0.0
+    source: str = "manual"
+    failures: list[tuple[str, str]] = field(default_factory=list)
+    missing_targets: list[str] = field(default_factory=list)
+
+    @property
+    def attempted(self) -> int:
+        return self.success + self.failed
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "success": self.success,
+            "failed": self.failed,
+            "skipped": self.skipped,
+            "duration": round(self.duration, 2),
+            "source": self.source,
+            "failures": [
+                {"umo": umo, "reason": reason} for umo, reason in self.failures[:20]
+            ],
+            "missing_targets": list(self.missing_targets[:20]),
+        }
+
+
+class RateLimiter:
+    """滑动窗口限速器，把发送频率压到每分钟 N 条以内。"""
+
+    def __init__(self, max_per_minute: int) -> None:
+        self.limit = max(0, int(max_per_minute))
+        self._stamps: deque[float] = deque()
+
+    async def acquire(self) -> None:
+        if self.limit <= 0:
+            return
+        while True:
+            now = time.monotonic()
+            while self._stamps and now - self._stamps[0] >= 60:
+                self._stamps.popleft()
+            if len(self._stamps) < self.limit:
+                self._stamps.append(now)
+                return
+            wait = 60 - (now - self._stamps[0])
+            await asyncio.sleep(max(wait, 0.05))
 
 
 # --------------------------------------------------------------------------- #
 # 插件主体
 # --------------------------------------------------------------------------- #
 class OfficialBroadcastPlugin(Star):
-    """全群广播插件。"""
-
-    def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
-        super().__init__(context)
-        self.config = config
-
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
+        super().__init__(context, config)
+        self.config = config or {}
         self._data_dir = self._resolve_data_dir()
-        self._registry_path = self._data_dir / "groups.json"
+        self._settings_path = self._data_dir / "settings.json"
+        self._registry_path = self._data_dir / "sessions.json"
         self._state_path = self._data_dir / "state.json"
+        self._legacy_registry_path = self._data_dir / "groups.json"
 
-        self._groups: dict[str, dict[str, Any]] = {}
-        self._state: dict[str, Any] = {"date": "", "sent": 0}
+        self._settings = Settings()
+        self._registry: dict[str, dict[str, Any]] = {}
+        self._state: dict[str, Any] = {"date": "", "sent": 0, "last_result": None}
         self._busy = False
         self._task: asyncio.Task | None = None
-        self._sync_task: asyncio.Task | None = None
+        self._flush_task: asyncio.Task | None = None
         self._scheduler: Any = None
+        self._schedule_error = ""
 
+        self._load_settings()
         self._load_registry()
         self._load_state()
+        self._register_web_apis()
 
-        # 插件热重载时 __init__ 里也要建好定时任务，不能只依赖 on_astrbot_loaded
+        # 插件热重载时 __init__ 也要重建定时任务，不能只靠 on_astrbot_loaded
         try:
-            self._setup_scheduler()
+            ok, message = self._reschedule()
+            if ok:
+                logger.info(f"[broadcast] {message}")
+            elif self._settings.enable_schedule:
+                logger.warning(f"[broadcast] 定时任务未生效：{message}")
         except Exception:
             logger.exception("[broadcast] 初始化定时任务失败")
 
-        # 配置页的「立即同步群列表」是开关式触发器：保存配置会热重载插件，
-        # 加载时发现开关为 true 就执行一次同步，并把开关复位。
-        if self._bool_conf("sync_groups_now", False):
-            try:
-                self._sync_task = asyncio.create_task(self._consume_sync_trigger())
-            except RuntimeError:
-                logger.warning("[broadcast] 当前没有事件循环，跳过群列表同步触发")
-
     # ------------------------------------------------------------------ #
-    # 初始化辅助
+    # 基础工具
     # ------------------------------------------------------------------ #
     @staticmethod
     def _resolve_data_dir() -> Path:
-        """数据目录：优先 data/plugin_data/<plugin>，退化为插件目录下 data/。"""
         try:
-            path = Path(StarTools.get_data_dir(PLUGIN_NAME))
+            return Path(StarTools.get_data_dir(PLUGIN_NAME))
         except Exception:
-            try:
-                from astrbot.core.utils.astrbot_path import (
-                    get_astrbot_plugin_data_path,
-                )
+            return Path("data") / "plugin_data" / PLUGIN_NAME
 
-                path = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
-            except Exception:
-                path = Path(__file__).resolve().parent / "data"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+    def _tz(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(self._settings.timezone)
+        except Exception:
+            return ZoneInfo(DEFAULT_TIMEZONE)
+
+    def _today(self) -> str:
+        return datetime.now(self._tz()).strftime("%Y-%m-%d")
+
+    def _config_enabled(self) -> bool:
+        try:
+            return bool(self.config.get("enabled", True))
+        except Exception:
+            return True
 
     @staticmethod
-    def _write_json(path: Path, payload: Any) -> None:
-        """原子写入，避免进程被杀导致 JSON 截断。"""
+    def _atomic_write(path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         os.replace(tmp, path)
 
+    def _backup_broken(self, path: Path) -> None:
+        try:
+            backup = path.with_suffix(path.suffix + f".broken.{int(time.time())}")
+            path.replace(backup)
+            logger.warning(f"[broadcast] 配置文件损坏，已备份到 {backup}")
+        except Exception:
+            logger.warning("[broadcast] 配置文件损坏且备份失败，将使用默认配置")
+
+    # ------------------------------------------------------------------ #
+    # 配置读写
+    # ------------------------------------------------------------------ #
+    def _load_settings(self) -> None:
+        if not self._settings_path.exists():
+            self._settings = self._migrate_legacy_config()
+            try:
+                self._atomic_write(self._settings_path, self._settings.to_dict())
+                logger.info("[broadcast] 已生成默认配置 settings.json")
+            except Exception:
+                logger.exception("[broadcast] 写入默认配置失败")
+            return
+
+        try:
+            raw = json.loads(self._settings_path.read_text(encoding="utf-8"))
+            self._settings = Settings.from_dict(raw)
+        except SettingsError as exc:
+            logger.error(f"[broadcast] 配置校验失败，回退默认值：{exc}")
+            self._backup_broken(self._settings_path)
+            self._settings = Settings()
+        except Exception:
+            logger.exception("[broadcast] 读取配置失败，回退默认值")
+            self._backup_broken(self._settings_path)
+            self._settings = Settings()
+
+    def _migrate_legacy_config(self) -> Settings:
+        """把旧版 _conf_schema.json 里的字段一次性迁移到 settings.json。"""
+        settings = Settings()
+        try:
+            raw = dict(self.config) if self.config else {}
+        except Exception:
+            return settings
+        if not raw:
+            return settings
+        try:
+            settings.admin_uids = _parse_str_list(raw.get("admin_uids", []))
+            settings.exclude_umos = _parse_umo_list(
+                raw.get("exclude_umos", []), "exclude_umos"
+            )
+            settings.send_interval = min(
+                max(float(raw.get("send_interval", DEFAULT_INTERVAL)), 0.0),
+                MAX_INTERVAL,
+            )
+            settings.max_per_minute = max(
+                0, min(int(raw.get("max_per_minute", DEFAULT_MAX_PER_MINUTE)), 60)
+            )
+            settings.daily_limit = max(
+                0, int(raw.get("daily_limit", DEFAULT_DAILY_LIMIT))
+            )
+            settings.enable_schedule = bool(raw.get("enable_schedule", False))
+            settings.schedule_message = str(raw.get("schedule_message", "") or "")
+            settings.timezone = str(raw.get("timezone", DEFAULT_TIMEZONE))
+            settings.auto_register = bool(raw.get("auto_discover", True))
+            cron = str(raw.get("schedule_cron", "") or "").strip()
+            if cron:
+                parsed = _cron_to_schedule(cron)
+                if parsed:
+                    settings.schedule = parsed
+            logger.info("[broadcast] 已从旧版插件配置迁移设置")
+        except Exception:
+            logger.warning("[broadcast] 旧配置迁移失败，使用默认设置", exc_info=True)
+        return settings
+
+    def _save_settings(self) -> None:
+        self._atomic_write(self._settings_path, self._settings.to_dict())
+
+    def _set_enabled(self, value: bool) -> None:
+        try:
+            self.config["enabled"] = bool(value)
+        except Exception:
+            return
+        save = getattr(self.config, "save_config", None)
+        if callable(save):
+            try:
+                save()
+            except Exception:
+                logger.warning("[broadcast] 写入插件总开关失败", exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # 会话登记表
+    # ------------------------------------------------------------------ #
     def _load_registry(self) -> None:
-        if not self._registry_path.exists():
+        path = self._registry_path
+        if not path.exists() and self._legacy_registry_path.exists():
+            path = self._legacy_registry_path
+        if not path.exists():
             return
         try:
-            raw = json.loads(self._registry_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            backup = self._registry_path.with_suffix(".json.bak")
-            with suppress(Exception):
-                os.replace(self._registry_path, backup)
-            logger.warning(f"[broadcast] 群列表文件损坏，已备份到 {backup.name}：{exc}")
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            self._backup_broken(path)
             return
-
-        groups = raw.get("groups") if isinstance(raw, dict) else None
-        if not isinstance(groups, dict):
-            groups = raw if isinstance(raw, dict) else {}
-        for umo, item in groups.items():
-            if not isinstance(umo, str) or not umo:
+        if not isinstance(raw, dict):
+            return
+        for umo, item in raw.items():
+            if not isinstance(umo, str) or not _UMO_RE.match(umo):
                 continue
-            if not isinstance(item, dict):
-                item = {}
-            try:
-                record = GroupRecord.from_umo(umo, name=str(item.get("name") or ""))
-                record.last_seen = float(item.get("last_seen") or record.last_seen)
-            except (TypeError, ValueError):
-                # 单条记录损坏不应让整个插件加载失败
-                continue
-            self._groups[umo] = record.to_dict()
-        logger.info(f"[broadcast] 已加载 {len(self._groups)} 个群聊记录")
+            record = item if isinstance(item, dict) else {}
+            self._registry[umo] = {
+                "name": str(record.get("name") or ""),
+                "last_seen": float(record.get("last_seen") or 0.0),
+            }
+        logger.info(f"[broadcast] 已加载 {len(self._registry)} 条会话记录")
 
+    def _save_registry(self) -> None:
+        try:
+            self._atomic_write(self._registry_path, self._registry)
+        except Exception:
+            logger.warning("[broadcast] 写入会话登记表失败", exc_info=True)
+
+    def _record_session(self, umo: str, name: str = "") -> bool:
+        if not _UMO_RE.match(umo or ""):
+            return False
+        record = self._registry.setdefault(umo, {"name": "", "last_seen": 0.0})
+        changed = False
+        if name and record.get("name") != name:
+            record["name"] = name
+            changed = True
+        now = time.time()
+        if now - float(record.get("last_seen") or 0) > 60:
+            record["last_seen"] = now
+            changed = True
+        return changed
+
+    def _schedule_flush(self) -> None:
+        """合并短时间内的多次登记，避免每条消息都写盘。"""
+        if self._flush_task and not self._flush_task.done():
+            return
+        loop = asyncio.get_event_loop()
+        self._flush_task = loop.create_task(self._flush_later())
+
+    async def _flush_later(self) -> None:
+        try:
+            await asyncio.sleep(REGISTRY_FLUSH_DELAY)
+            self._save_registry()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("[broadcast] 延迟写入会话表失败", exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    # 运行状态
+    # ------------------------------------------------------------------ #
     def _load_state(self) -> None:
         if not self._state_path.exists():
             return
         try:
             raw = json.loads(self._state_path.read_text(encoding="utf-8"))
         except Exception:
+            self._backup_broken(self._state_path)
             return
-        if not isinstance(raw, dict):
-            return
-        try:
-            sent = int(float(raw.get("sent") or 0))
-        except (TypeError, ValueError):
-            sent = 0
-        self._state = {"date": str(raw.get("date") or ""), "sent": max(0, sent)}
+        if isinstance(raw, dict):
+            self._state = {
+                "date": str(raw.get("date") or ""),
+                "sent": int(raw.get("sent") or 0),
+                "last_result": raw.get("last_result"),
+            }
 
-    def _save_registry(self) -> None:
+    def _save_state(self) -> None:
         try:
-            self._write_json(
-                self._registry_path, {"version": 1, "groups": self._groups}
-            )
-        except Exception as exc:
-            logger.warning(f"[broadcast] 保存群列表失败：{exc}")
-
-    def _persist_state(self) -> None:
-        try:
-            self._write_json(self._state_path, self._state)
-        except Exception as exc:
-            logger.warning(f"[broadcast] 保存状态失败：{exc}")
-
-    # ------------------------------------------------------------------ #
-    # 配置读取
-    # ------------------------------------------------------------------ #
-    def _conf(self, key: str, default: Any = None) -> Any:
-        cfg = self.config
-        if cfg is None:
-            return default
-        try:
-            value = cfg.get(key, default)
+            self._atomic_write(self._state_path, self._state)
         except Exception:
-            return default
-        return default if value is None else value
+            logger.warning("[broadcast] 写入运行状态失败", exc_info=True)
 
-    def _bool_conf(self, key: str, default: bool) -> bool:
-        value = self._conf(key, default)
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+    def _quota_used(self) -> int:
+        if self._state.get("date") != self._today():
+            self._state = {"date": self._today(), "sent": 0, "last_result": None}
+        return int(self._state.get("sent") or 0)
 
-    def _int_conf(self, key: str, default: int) -> int:
+    def _quota_consume(self, count: int = 1) -> None:
+        used = self._quota_used()
+        self._state["date"] = self._today()
+        self._state["sent"] = used + count
+        self._save_state()
+
+    # ------------------------------------------------------------------ #
+    # 会话发现
+    # ------------------------------------------------------------------ #
+    async def _collect_sessions(self, refresh: bool = False) -> list[SessionInfo]:
+        """汇总所有已知会话。
+
+        Args:
+            refresh: 是否额外向 aiocqhttp 协议端拉取群/好友列表。
+        """
+        found: dict[str, SessionInfo] = {}
+        adapter_names = self._adapter_name_map()
+
+        def add(umo: str, name: str = "", source: str = "") -> None:
+            if not _UMO_RE.match(umo or ""):
+                return
+            platform, message_type, session_id = _split_umo(umo)
+            if platform in NON_BROADCAST_PLATFORMS:
+                return
+            item = found.get(umo)
+            if item is None:
+                item = SessionInfo(
+                    umo=umo,
+                    platform=platform,
+                    message_type=message_type,
+                    session_id=session_id,
+                    adapter=adapter_names.get(platform, ""),
+                )
+                found[umo] = item
+            if name and not item.display_name:
+                item.display_name = name
+            if source and source not in item.sources:
+                item.sources.append(source)
+
+        for umo, record in self._registry.items():
+            add(umo, str(record.get("name") or ""), "registry")
+
+        for session in self._adapter_sessions():
+            add(session["umo"], session.get("name", ""), "adapter")
+
+        for umo, name in await self._db_sessions():
+            add(umo, name, "database")
+
+        if refresh:
+            for session in await self._sync_aiocqhttp():
+                add(session["umo"], session.get("name", ""), "aiocqhttp")
+
+        return sorted(
+            found.values(),
+            key=lambda s: (s.platform, s.message_type, s.display_name or s.session_id),
+        )
+
+    def _adapter_name_map(self) -> dict[str, str]:
+        """平台实例 ID -> 适配器类型名（如 qq_official / aiocqhttp）。"""
         try:
-            return int(float(self._conf(key, default)))
-        except (TypeError, ValueError):
-            return default
+            instances = self.context.platform_manager.get_insts()
+        except Exception:
+            return {}
+        mapping: dict[str, str] = {}
+        for instance in instances:
+            try:
+                meta = instance.meta()
+            except Exception:
+                continue
+            pid = str(getattr(meta, "id", "") or "")
+            name = str(getattr(meta, "name", "") or "")
+            if pid and name:
+                mapping[pid] = name
+        return mapping
 
-    def _float_conf(self, key: str, default: float) -> float:
+    def _adapter_sessions(self) -> list[dict[str, str]]:
+        """读取平台适配器内存中的会话缓存（只做鸭子类型探测）。"""
         try:
-            return float(self._conf(key, default))
-        except (TypeError, ValueError):
-            return default
-
-    def _str_list_conf(self, key: str) -> list[str]:
-        value = self._conf(key, [])
-        if isinstance(value, str):
-            value = [value]
-        if not isinstance(value, (list, tuple, set)):
+            instances = self.context.platform_manager.get_insts()
+        except Exception:
             return []
-        result: list[str] = []
-        for item in value:
-            text = str(item).strip()
-            if text:
-                result.append(text)
+        result: list[dict[str, str]] = []
+        for instance in instances:
+            try:
+                platform_id = str(instance.meta().id or "")
+            except Exception:
+                continue
+            scenes = getattr(instance, "_session_scene", None)
+            if not isinstance(scenes, dict):
+                continue
+            for session_id, scene in list(scenes.items()):
+                if scene == "group":
+                    message_type = GROUP_MESSAGE_TYPE
+                elif scene in {"friend", "private"}:
+                    message_type = "FriendMessage"
+                else:
+                    continue
+                result.append({"umo": f"{platform_id}:{message_type}:{session_id}"})
         return result
 
-    def _timezone(self) -> Any:
-        name = str(self._conf("timezone", DEFAULT_TIMEZONE) or "").strip()
-        if not name or ZoneInfo is None:
-            return None
+    async def _db_sessions(self) -> list[tuple[str, str]]:
+        """从 AstrBot 数据库读取已知 UMO（与 WebUI 会话列表同源）。"""
+        if not SQLALCHEMY_AVAILABLE:
+            return []
+        db = None
         try:
-            return ZoneInfo(name)
+            db = self.context.get_db()
         except Exception:
-            logger.warning(f"[broadcast] 无效时区 {name}，改用系统本地时区")
-            return None
+            return []
+        if db is None:
+            return []
+        try:
+            async with db.get_db() as session:
+                result = await session.execute(
+                    sql_text(
+                        "SELECT umo FROM ("
+                        " SELECT user_id AS umo FROM conversations"
+                        " UNION ALL SELECT umo FROM umo_senders"
+                        " UNION ALL SELECT umo FROM umo_aliases"
+                        ") WHERE umo IS NOT NULL AND umo != ''"
+                        f" GROUP BY umo LIMIT {DB_UMO_LIMIT}"
+                    )
+                )
+                umos = [str(row[0]) for row in result.fetchall()]
+        except Exception as exc:
+            logger.debug(f"[broadcast] 读取数据库会话失败：{exc}")
+            return []
+
+        names: dict[str, str] = {}
+        try:
+            async with db.get_db() as session:
+                result = await session.execute(
+                    sql_text(
+                        "SELECT umo, COALESCE(NULLIF(user_alias, ''), "
+                        "NULLIF(auto_name, ''), '') FROM umo_aliases"
+                    )
+                )
+                for row in result.fetchall():
+                    umo, name = str(row[0]), str(row[1] or "")
+                    if name:
+                        names[umo] = name
+        except Exception:
+            pass
+
+        return [(umo, names.get(umo, "")) for umo in umos]
+
+    def _aiocqhttp_instances(self) -> list[tuple[str, Any]]:
+        try:
+            instances = self.context.platform_manager.get_insts()
+        except Exception:
+            return []
+        result: list[tuple[str, Any]] = []
+        for instance in instances:
+            try:
+                meta = instance.meta()
+            except Exception:
+                continue
+            if str(getattr(meta, "name", "") or "") == "aiocqhttp":
+                result.append((str(getattr(meta, "id", "") or ""), instance))
+        return result
+
+    async def _sync_aiocqhttp(self) -> list[dict[str, str]]:
+        """向 aiocqhttp 协议端拉取群与好友列表（仅页面刷新时调用）。"""
+        collected: list[dict[str, str]] = []
+        for platform_id, instance in self._aiocqhttp_instances():
+            client = None
+            try:
+                client = instance.get_client()
+            except Exception:
+                client = None
+            if client is None:
+                continue
+
+            for action, message_type in (
+                ("get_group_list", GROUP_MESSAGE_TYPE),
+                ("get_friend_list", "FriendMessage"),
+            ):
+                try:
+                    rows = await asyncio.wait_for(
+                        client.api.call_action(action), timeout=8
+                    )
+                except Exception as exc:
+                    logger.debug(f"[broadcast] {action} 失败：{exc}")
+                    continue
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    sid = row.get("group_id") or row.get("user_id")
+                    if sid is None:
+                        continue
+                    name = str(row.get("group_name") or row.get("nickname") or "")
+                    umo = f"{platform_id}:{message_type}:{sid}"
+                    collected.append({"umo": umo, "name": name})
+                    self._record_session(umo, name)
+        if collected:
+            self._save_registry()
+        return collected
 
     # ------------------------------------------------------------------ #
-    # 权限
+    # 目标解析
+    # ------------------------------------------------------------------ #
+    async def _resolve_targets(
+        self, settings: Settings, refresh: bool = False
+    ) -> tuple[list[SessionInfo], list[str]]:
+        """返回 (实际发送目标, 白名单中未发现的 UMO)。"""
+        sessions = await self._collect_sessions(refresh=refresh)
+        index = {s.umo: s for s in sessions}
+        exclude = set(settings.exclude_umos)
+
+        if settings.target_umos:
+            targets: list[SessionInfo] = []
+            missing: list[str] = []
+            for umo in settings.target_umos:
+                if umo in exclude:
+                    continue
+                info = index.get(umo)
+                if info is None:
+                    platform, message_type, session_id = _split_umo(umo)
+                    info = SessionInfo(
+                        umo=umo,
+                        platform=platform,
+                        message_type=message_type,
+                        session_id=session_id,
+                        display_name=session_id,
+                    )
+                    missing.append(umo)
+                targets.append(info)
+            return targets, missing
+
+        return [s for s in sessions if s.umo not in exclude], []
+
+    # ------------------------------------------------------------------ #
+    # 发送
+    # ------------------------------------------------------------------ #
+    def _ensure_group_scene(self, session: SessionInfo) -> None:
+        """预热 QQ 官方适配器的会话场景缓存。
+
+        QQ 官方适配器在缺少 msg_id 时，只有 ``_session_scene`` 记录为
+        group 才允许主动群发；该缓存在重启后为空，会导致消息被静默丢弃。
+        """
+        if session.message_type != GROUP_MESSAGE_TYPE:
+            return
+        try:
+            platform = self.context.get_platform_inst(session.platform)
+        except Exception:
+            return
+        scenes = getattr(platform, "_session_scene", None) if platform else None
+        if isinstance(scenes, dict):
+            scenes.setdefault(session.session_id, "group")
+
+    async def _send_one(self, session: SessionInfo, message: str) -> tuple[bool, str]:
+        self._ensure_group_scene(session)
+        try:
+            found = await self.context.send_message(
+                session.umo, MessageChain().message(message)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        if found is False:
+            return False, "未找到对应的平台实例"
+        return True, ""
+
+    async def do_broadcast(
+        self, message: str, *, origin_umo: str = "", source: str = "manual"
+    ) -> BroadcastResult | None:
+        """执行一次广播。已有任务在跑时返回 None。"""
+        if self._busy:
+            return None
+
+        message = (message or "").strip()
+        if not message:
+            return BroadcastResult(source=source)
+        if not self._config_enabled():
+            return BroadcastResult(source=source)
+
+        self._busy = True
+        started = time.monotonic()
+        result = BroadcastResult(source=source)
+        try:
+            settings = self._settings
+            targets, missing = await self._resolve_targets(settings)
+            result.total = len(targets)
+            result.missing_targets = missing
+            if not targets:
+                return result
+
+            limiter = RateLimiter(settings.max_per_minute)
+            daily_limit = settings.daily_limit
+            interval = settings.send_interval
+
+            for index, session in enumerate(targets):
+                if daily_limit > 0 and self._quota_used() >= daily_limit:
+                    result.skipped = len(targets) - index
+                    logger.warning(
+                        f"[broadcast] 今日额度已用尽（{daily_limit}），"
+                        f"剩余 {result.skipped} 个会话跳过"
+                    )
+                    break
+
+                await limiter.acquire()
+                ok, reason = await self._send_one(session, message)
+                self._quota_consume(1)
+                if ok:
+                    result.success += 1
+                else:
+                    result.failed += 1
+                    result.failures.append((session.umo, reason))
+                    logger.warning(f"[broadcast] 发送失败 {session.umo}：{reason}")
+
+                if interval > 0 and index < len(targets) - 1:
+                    await asyncio.sleep(interval)
+
+            result.duration = time.monotonic() - started
+            self._state["last_result"] = {
+                "time": datetime.now(self._tz()).isoformat(timespec="seconds"),
+                "source": source,
+                "total": result.total,
+                "success": result.success,
+                "failed": result.failed,
+                "skipped": result.skipped,
+            }
+            self._save_state()
+            logger.info(
+                f"[broadcast] 完成：成功 {result.success}，失败 {result.failed}，"
+                f"跳过 {result.skipped}，耗时 {result.duration:.1f}s"
+            )
+            return result
+        finally:
+            self._busy = False
+
+    # ------------------------------------------------------------------ #
+    # 定时任务
+    # ------------------------------------------------------------------ #
+    def _shutdown_scheduler(self) -> None:
+        scheduler = self._scheduler
+        self._scheduler = None
+        if scheduler is None:
+            return
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:
+            logger.debug("[broadcast] 关闭调度器时出错", exc_info=True)
+
+    def _reschedule(self) -> tuple[bool, str]:
+        """清掉旧任务并按最新配置重新注册。"""
+        self._shutdown_scheduler()
+        self._schedule_error = ""
+
+        if not self._settings.enable_schedule:
+            return False, "定时广播未开启"
+        if not self._settings.schedule_message.strip():
+            self._schedule_error = "定时消息为空，到点不会发送"
+            return False, self._schedule_error
+        if not self._config_enabled():
+            self._schedule_error = "插件总开关已关闭"
+            return False, self._schedule_error
+        if not SCHEDULER_AVAILABLE:
+            self._schedule_error = "未安装 apscheduler，无法注册定时任务"
+            return False, self._schedule_error
+
+        try:
+            cron = self._settings.schedule.to_cron()
+        except SettingsError as exc:
+            self._schedule_error = str(exc)
+            return False, self._schedule_error
+
+        try:
+            trigger = CronTrigger.from_crontab(cron, timezone=self._tz())
+            scheduler = AsyncIOScheduler(timezone=self._tz())
+            scheduler.add_job(
+                self._run_scheduled,
+                trigger,
+                id=SCHEDULE_JOB_ID,
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=600,
+            )
+            scheduler.start()
+        except Exception as exc:
+            self._schedule_error = f"注册定时任务失败：{exc}"
+            logger.exception("[broadcast] 注册定时任务失败")
+            return False, self._schedule_error
+
+        self._scheduler = scheduler
+        return True, f"定时广播已生效（{self._settings.schedule.describe()}）"
+
+    async def _run_scheduled(self) -> None:
+        message = self._settings.schedule_message.strip()
+        if not message:
+            logger.warning("[broadcast] 定时任务触发，但消息为空，已跳过")
+            return
+        if self._busy:
+            logger.warning("[broadcast] 上一次广播仍在执行，本次定时任务跳过")
+            return
+        logger.info("[broadcast] 定时广播开始")
+        await self.do_broadcast(message, source="schedule")
+
+    def _next_run_at(self) -> str:
+        if self._scheduler is None:
+            return ""
+        try:
+            job = self._scheduler.get_job(SCHEDULE_JOB_ID)
+            next_run = getattr(job, "next_run_time", None) if job else None
+            return next_run.isoformat() if next_run else ""
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------ #
+    # Web API
+    # ------------------------------------------------------------------ #
+    def _register_web_apis(self) -> None:
+        if not WEB_API_AVAILABLE:
+            logger.warning(
+                "[broadcast] 当前 AstrBot 版本不支持 astrbot.api.web，"
+                "可视化配置页不可用（需要 4.24.2 及以上）"
+            )
+            return
+        routes = (
+            (
+                f"/{PLUGIN_NAME}/config/get",
+                self.api_get_config,
+                ["GET"],
+                "读取广播配置",
+            ),
+            (
+                f"/{PLUGIN_NAME}/config/save",
+                self.api_save_config,
+                ["POST"],
+                "保存广播配置",
+            ),
+            (
+                f"/{PLUGIN_NAME}/config/refresh",
+                self.api_refresh_sessions,
+                ["POST"],
+                "刷新会话列表",
+            ),
+        )
+        for route, handler, methods, desc in routes:
+            try:
+                self.context.register_web_api(route, handler, methods, desc)
+            except Exception:
+                logger.exception(f"[broadcast] 注册 Web API 失败：{route}")
+
+    def _overview(self) -> dict[str, Any]:
+        used = self._quota_used()
+        return {
+            "enabled": self._config_enabled(),
+            "today_sent": used,
+            "daily_limit": self._settings.daily_limit,
+            "quota_left": (
+                max(self._settings.daily_limit - used, 0)
+                if self._settings.daily_limit > 0
+                else -1
+            ),
+            "busy": self._busy,
+            "schedule_active": self._scheduler is not None,
+            "schedule_error": self._schedule_error,
+            "next_run_at": self._next_run_at(),
+            "cron": self._settings.schedule.to_cron()
+            if self._settings.enable_schedule
+            else "",
+            "last_result": self._state.get("last_result"),
+            "web_api": WEB_API_AVAILABLE,
+            "scheduler_available": SCHEDULER_AVAILABLE,
+            "aiocqhttp": [pid for pid, _ in self._aiocqhttp_instances()],
+        }
+
+    async def _api_payload(self) -> dict[str, Any]:
+        sessions = await self._collect_sessions(refresh=False)
+        settings = self._settings
+        target = set(settings.target_umos)
+        exclude = set(settings.exclude_umos)
+        eligible = [
+            s
+            for s in sessions
+            if s.umo not in exclude and (not target or s.umo in target)
+        ]
+        return {
+            "settings": settings.to_dict(),
+            "sessions": [s.to_dict() for s in sessions],
+            "platforms": sorted({s.platform for s in sessions}),
+            "message_types": sorted({s.message_type for s in sessions}),
+            "overview": self._overview(),
+            "summary": {
+                "total": len(sessions),
+                "selected": len(settings.target_umos),
+                "excluded": len(settings.exclude_umos),
+                "eligible": len(eligible),
+                "mode": "targeted" if settings.target_umos else "all",
+            },
+        }
+
+    async def api_get_config(self):
+        try:
+            return _web.json_response(await self._api_payload())
+        except Exception as exc:
+            logger.exception("[broadcast] 读取配置失败")
+            return _web.error_response(f"读取配置失败：{exc}", status_code=500)
+
+    async def api_save_config(self):
+        try:
+            payload = await _web.request.json(default={})
+        except Exception as exc:
+            return _web.error_response(f"请求体解析失败：{exc}")
+        if not isinstance(payload, dict):
+            return _web.error_response("请求体必须是 JSON 对象")
+
+        try:
+            settings = Settings.from_dict(payload, base=self._settings)
+        except SettingsError as exc:
+            return _web.error_response(str(exc))
+
+        self._settings = settings
+        try:
+            self._save_settings()
+        except Exception as exc:
+            logger.exception("[broadcast] 保存配置失败")
+            return _web.error_response(f"写入配置文件失败：{exc}", status_code=500)
+
+        if "enabled" in payload:
+            self._set_enabled(bool(payload.get("enabled")))
+
+        ok, message = self._reschedule()
+        if not ok and settings.enable_schedule:
+            logger.warning(f"[broadcast] 定时任务未生效：{message}")
+
+        data = await self._api_payload()
+        data["schedule_message"] = message
+        data["schedule_ok"] = ok
+        return _web.json_response(data)
+
+    async def api_refresh_sessions(self):
+        try:
+            payload = await _web.request.json(default={})
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        refresh_remote = bool(payload.get("remote", True))
+        try:
+            sessions = await self._collect_sessions(refresh=refresh_remote)
+        except Exception as exc:
+            logger.exception("[broadcast] 刷新会话失败")
+            return _web.error_response(f"刷新会话失败：{exc}", status_code=500)
+        return _web.json_response(
+            {
+                "sessions": [s.to_dict() for s in sessions],
+                "platforms": sorted({s.platform for s in sessions}),
+                "message_types": sorted({s.message_type for s in sessions}),
+                "overview": self._overview(),
+            }
+        )
+
+    # ------------------------------------------------------------------ #
+    # 指令
+    # ------------------------------------------------------------------ #
+    @filter.command("broadcast")
+    async def broadcast(self, event: AstrMessageEvent):
+        """向目标会话广播一条消息。"""
+        if not self._config_enabled():
+            yield event.plain_result("⚠️ 广播插件已在配置中禁用。")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result(
+                "⚠️ 权限不足：仅管理员可使用广播指令。\n"
+                f"你的 UID：{self._sender_id(event) or '未知'}\n"
+                "可在插件配置页把它加入管理员列表。"
+            )
+            return
+
+        message = self._payload(event)
+        if not message:
+            yield event.plain_result(
+                "用法：/broadcast <消息内容>\n"
+                "例如：/broadcast 今晚 20:00 例行维护，预计 10 分钟"
+            )
+            return
+
+        if len(message) > MAX_MESSAGE_LENGTH:
+            yield event.plain_result(
+                f"⚠️ 消息过长，请控制在 {MAX_MESSAGE_LENGTH} 字以内。"
+            )
+            return
+
+        if self._busy:
+            yield event.plain_result("⚠️ 已有广播任务在执行，请等待完成后再试。")
+            return
+
+        targets, _ = await self._resolve_targets(self._settings)
+        if not targets:
+            yield event.plain_result(await self._empty_targets_hint())
+            return
+
+        used = self._quota_used()
+        limit = self._settings.daily_limit
+        if limit > 0 and used >= limit:
+            yield event.plain_result(
+                f"⚠️ 今日主动消息额度已用尽（{used}/{limit}），"
+                "请明天再试或调整每日额度。"
+            )
+            return
+
+        estimated = int(len(targets) * (self._settings.send_interval + 0.35))
+        yield event.plain_result(
+            f"📢 开始广播，目标 {len(targets)} 个会话，预计耗时约 {estimated} 秒……"
+        )
+
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        self._task = asyncio.create_task(
+            self._broadcast_and_report(message, origin, "manual")
+        )
+
+    async def _broadcast_and_report(
+        self, message: str, origin_umo: str, source: str
+    ) -> None:
+        try:
+            result = await self.do_broadcast(
+                message, origin_umo=origin_umo, source=source
+            )
+        except Exception as exc:
+            logger.exception("[broadcast] 广播任务异常")
+            if origin_umo:
+                await self._reply(origin_umo, f"❌ 广播失败：{exc}")
+            return
+
+        if result is None:
+            if origin_umo:
+                await self._reply(origin_umo, "⚠️ 已有广播任务在执行，本次未发送。")
+            return
+        if origin_umo:
+            await self._reply(origin_umo, self._format_report(result))
+
+    async def _reply(self, umo: str, text: str) -> None:
+        try:
+            await self.context.send_message(umo, MessageChain().message(text))
+        except Exception:
+            logger.warning(f"[broadcast] 回执发送失败：{umo}", exc_info=True)
+
+    @filter.command("broadcast_status")
+    async def broadcast_status(self, event: AstrMessageEvent):
+        """查看广播运行状态。"""
+        if not self._is_admin(event):
+            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
+            return
+
+        settings = self._settings
+        overview = self._overview()
+        sessions = await self._collect_sessions()
+        targets, missing = await self._resolve_targets(settings)
+        lines = [
+            "📊 广播运行状态",
+            f"插件开关：{'启用' if overview['enabled'] else '禁用'}",
+            f"已知会话：{len(sessions)} 个｜本次目标：{len(targets)} 个",
+            f"目标模式：{'白名单' if settings.target_umos else '全部会话'}",
+            f"排除名单：{len(settings.exclude_umos)} 个",
+            f"发送间隔：{settings.send_interval:g}s｜"
+            f"限速：{settings.max_per_minute or '不限'}/分钟",
+            f"今日已发：{overview['today_sent']}"
+            + (
+                f" / {settings.daily_limit}" if settings.daily_limit > 0 else "（不限）"
+            ),
+            f"定时广播：{'开启' if settings.enable_schedule else '关闭'}",
+        ]
+        if settings.enable_schedule:
+            lines.append(f"计划：{settings.schedule.describe()}")
+            lines.append(f"下次触发：{overview['next_run_at'] or '未注册'}")
+            if overview["schedule_error"]:
+                lines.append(f"⚠️ {overview['schedule_error']}")
+        if missing:
+            lines.append(f"⚠️ 白名单中 {len(missing)} 个 UMO 当前未发现")
+        if not overview["web_api"]:
+            lines.append("⚠️ 当前 AstrBot 版本不支持可视化配置页")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("broadcast_list")
+    async def broadcast_list(self, event: AstrMessageEvent):
+        """列出已发现的会话。"""
+        if not self._is_admin(event):
+            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
+            return
+
+        sessions = await self._collect_sessions()
+        if not sessions:
+            yield event.plain_result(await self._empty_targets_hint())
+            return
+
+        target = set(self._settings.target_umos)
+        exclude = set(self._settings.exclude_umos)
+        lines = [f"📋 已发现 {len(sessions)} 个会话（最多显示 40 条）"]
+        for session in sessions[:40]:
+            mark = (
+                "🚫"
+                if session.umo in exclude
+                else ("✅" if not target or session.umo in target else "⬜")
+            )
+            lines.append(f"{mark} {session.display_name}｜{session.umo}")
+        if len(sessions) > 40:
+            lines.append(f"…… 其余 {len(sessions) - 40} 条请到插件配置页查看")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("broadcast_reload")
+    async def broadcast_reload(self, event: AstrMessageEvent):
+        """重载配置并重建定时任务。"""
+        if not self._is_admin(event):
+            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
+            return
+        self._load_settings()
+        ok, message = self._reschedule()
+        yield event.plain_result(
+            ("✅ " if ok else "ℹ️ ")
+            + message
+            + f"\n会话数：{len(await self._collect_sessions())}"
+        )
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def record_group(self, event: AstrMessageEvent):
+        """收到任意消息时登记会话，便于后续广播。"""
+        if not self._settings.auto_register:
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if not umo:
+            return
+        if self._record_session(umo, self._session_name(event)):
+            self._schedule_flush()
+
+    # ------------------------------------------------------------------ #
+    # 辅助
     # ------------------------------------------------------------------ #
     @staticmethod
     def _sender_id(event: AstrMessageEvent) -> str:
@@ -326,794 +1384,110 @@ class OfficialBroadcastPlugin(Star):
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         uid = self._sender_id(event)
-        if not uid:
-            return False
-
-        admins = self._str_list_conf("admin_uids")
+        admins = self._settings.admin_uids
         if admins:
-            return uid in admins
-
-        # 未配置 admin_uids 时回退到 AstrBot 全局管理员，避免插件一装上就没人能用
+            return bool(uid) and uid in admins
         try:
-            if event.is_admin():
-                return True
-        except Exception:
-            pass
-        try:
-            global_admins = self.context.get_config().get("admins_id", []) or []
-            return uid in {str(item).strip() for item in global_admins}
+            return bool(event.is_admin())
         except Exception:
             return False
 
-    # ------------------------------------------------------------------ #
-    # 群列表维护
-    # ------------------------------------------------------------------ #
-    def _upsert_group(self, umo: str, group_name: str = "") -> bool:
-        """登记/更新一个群，返回是否有需要落盘的变化。"""
-        if not umo or umo.count(":") < 2:
-            return False
-        now = time.time()
-        record = self._groups.get(umo)
-        if record is None:
-            self._groups[umo] = GroupRecord.from_umo(umo, group_name).to_dict()
-            logger.info(f"[broadcast] 新登记群聊：{umo}")
-            return True
-        record["last_seen"] = now
-        if group_name and record.get("name") != group_name:
-            record["name"] = group_name
-            return True
-        return False
-
-    def _register_event_group(self, event: AstrMessageEvent) -> bool:
-        if not self._bool_conf("auto_discover", True):
-            return False
-        try:
-            umo = str(event.unified_msg_origin or "")
-            group_id = str(event.get_group_id() or "")
-        except Exception:
-            return False
-        if not umo or not group_id:
-            return False
-        return self._upsert_group(umo)
-
-    def _get_platform(self, platform_id: str) -> Any:
-        try:
-            return self.context.get_platform_inst(platform_id)
-        except Exception:
-            return None
-
-    def _ensure_group_scene(self, umo: str) -> None:
-        """补齐 QQ 官方适配器的群会话场景缓存。
-
-        适配器只有在 _session_scene[session_id] == "group" 时才允许不带 msg_id
-        的主动群消息；AstrBot 刚重启、群还没发过言时该缓存是空的，会导致广播被
-        静默跳过。这里用持久化的群列表把它补上。
-        """
-        try:
-            platform_id, message_type, session_id = umo.split(":", 2)
-        except ValueError:
-            return
-        if message_type != GROUP_MESSAGE_TYPE:
-            return
-        platform = self._get_platform(platform_id)
-        scenes = getattr(platform, "_session_scene", None) if platform else None
-        if isinstance(scenes, dict):
-            scenes.setdefault(session_id, "group")
-
-    async def _discover_from_platforms(self) -> None:
-        """从运行中的平台实例补充群列表（只读取适配器内存中已见过的群会话）。"""
-        if not self._bool_conf("auto_discover", True):
-            return
-        try:
-            instances = self.context.platform_manager.get_insts()
-        except Exception as exc:
-            logger.debug(f"[broadcast] 获取平台实例失败：{exc}")
-            return
-
-        changed = False
-        for instance in instances:
+    @staticmethod
+    def _session_name(event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        group = getattr(message_obj, "group", None)
+        name = str(getattr(group, "group_name", "") or "") if group else ""
+        if name:
+            return name
+        getter = getattr(event, "get_sender_name", None)
+        if callable(getter):
             try:
-                meta = instance.meta()
-                platform_id = str(getattr(meta, "id", "") or "")
+                return str(getter() or "")
             except Exception:
-                continue
+                return ""
+        return ""
 
-            # 适配器内存中见过的群会话（QQ 官方适配器会记录 scene）
-            scenes = getattr(instance, "_session_scene", None)
-            if isinstance(scenes, dict):
-                for session_id, scene in list(scenes.items()):
-                    if scene != "group":
-                        continue
-                    changed |= self._upsert_group(
-                        f"{platform_id}:{GROUP_MESSAGE_TYPE}:{session_id}"
-                    )
-
-        if changed:
-            self._save_registry()
-
-    def _platform_instances(self) -> list[Any]:
-        try:
-            return list(self.context.platform_manager.get_insts())
-        except Exception:
-            return []
-
-    def _aiocqhttp_instances(self) -> list[tuple[str, Any]]:
-        """返回 (平台实例 ID, 实例) 的 aiocqhttp 列表。"""
-        found: list[tuple[str, Any]] = []
-        for instance in self._platform_instances():
-            try:
-                meta = instance.meta()
-            except Exception:
-                continue
-            if str(getattr(meta, "name", "") or "") != "aiocqhttp":
-                continue
-            platform_id = str(getattr(meta, "id", "") or "")
-            if platform_id:
-                found.append((platform_id, instance))
-        return found
-
-    async def _consume_sync_trigger(self) -> None:
-        """消费配置页的「立即同步群列表」开关。
-
-        配置页没有可点击按钮，保存配置会热重载本插件，所以用 bool 开关当触发器：
-        加载时读到 true 就复位开关，然后等平台实例就绪，调用 aiocqhttp 的
-        get_group_list 把群写进群表。
-        """
-        self._reset_sync_flag()
-
-        if not self._aiocqhttp_instances() and not self._platform_instances():
-            # 插件可能先于平台加载，给平台连接留一点时间
-            for _ in range(SYNC_WAIT_SECONDS):
-                await asyncio.sleep(1)
-                if self._aiocqhttp_instances():
-                    break
-
-        instances = self._aiocqhttp_instances()
-        if not instances:
-            logger.warning(
-                "[broadcast] 群列表同步已跳过：没有已加载的 aiocqhttp 实例"
-                "（该功能仅 aiocqhttp 可用）"
-            )
-            return
-
-        before = len(self._groups)
-        for platform_id, instance in instances:
-            await self._discover_aiocqhttp(instance, platform_id)
-        added = len(self._groups) - before
-        if added:
-            self._save_registry()
-        logger.info(
-            f"[broadcast] 群列表同步完成：{len(instances)} 个 aiocqhttp 实例，"
-            f"新增 {added} 个群，当前共 {len(self._groups)} 个群"
-        )
-
-    def _reset_sync_flag(self) -> None:
-        """把触发开关复位，避免下次重载重复同步。"""
-        try:
-            if not isinstance(self.config, dict):
-                return
-            if not self.config.get("sync_groups_now"):
-                return
-            self.config["sync_groups_now"] = False
-            save = getattr(self.config, "save_config", None)
-            if callable(save):
-                save()
-        except Exception as exc:
-            logger.warning(f"[broadcast] 复位「立即同步」开关失败：{exc}")
-
-    async def _discover_aiocqhttp(self, instance: Any, platform_id: str) -> bool:
-        try:
-            client = instance.get_client()
-            if client is None:
-                return False
-            groups = await asyncio.wait_for(
-                client.api.call_action("get_group_list"), timeout=5
-            )
-        except Exception as exc:
-            logger.debug(f"[broadcast] get_group_list 失败：{exc}")
-            return False
-
-        changed = False
-        for item in groups or []:
-            try:
-                group_id = str(item.get("group_id") or "")
-            except Exception:
-                continue
-            if not group_id:
-                continue
-            changed |= self._upsert_group(
-                f"{platform_id}:{GROUP_MESSAGE_TYPE}:{group_id}",
-                group_name=str(item.get("group_name") or ""),
-            )
-        return changed
-
-    def _resolve_targets(self) -> list[dict[str, Any]]:
-        """按避开名单过滤后的广播目标。"""
-        exclude = self._str_list_conf("exclude_umos")
-        excluded_umos = {item for item in exclude if ":" in item}
-        excluded_ids = {item for item in exclude if ":" not in item}
-
-        targets: list[dict[str, Any]] = []
-        for umo, record in self._groups.items():
-            group_id = str(record.get("group_id") or "")
-            if umo in excluded_umos:
-                continue
-            if group_id and group_id in excluded_ids:
-                continue
-            targets.append(record)
-        targets.sort(
-            key=lambda r: (
-                str(r.get("platform_id") or ""),
-                str(r.get("group_id") or ""),
-            )
-        )
-        return targets
-
-    # ------------------------------------------------------------------ #
-    # 额度
-    # ------------------------------------------------------------------ #
-    def _today(self) -> str:
-        tz = self._timezone()
-        now = datetime.now(tz) if tz else datetime.now()
-        return now.strftime("%Y-%m-%d")
-
-    def _quota_used(self) -> int:
-        today = self._today()
-        if self._state.get("date") != today:
-            self._state = {"date": today, "sent": 0}
-        try:
-            return int(self._state.get("sent") or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    def _quota_limit(self) -> int:
-        return max(0, self._int_conf("daily_limit", DEFAULT_DAILY_LIMIT))
-
-    def _quota_available(self) -> bool:
-        limit = self._quota_limit()
-        return limit <= 0 or self._quota_used() < limit
-
-    def _bump_quota(self) -> None:
-        self._state["date"] = self._today()
-        self._state["sent"] = self._quota_used() + 1
-
-    # ------------------------------------------------------------------ #
-    # 发送
-    # ------------------------------------------------------------------ #
-    async def _safe_send(self, umo: str, text: str) -> bool:
-        ok, reason = await self._send_one(umo, text)
-        if not ok:
-            logger.warning(f"[broadcast] 发送到 {umo} 失败：{reason}")
-        return ok
-
-    async def _send_one(self, umo: str, text: str) -> tuple[bool, str]:
-        """向单个 UMO 发送文本，返回 (是否成功, 失败原因)。"""
-        try:
-            platform_id = umo.split(":", 1)[0]
-        except Exception:
-            return False, "UMO 格式不合法"
-
-        if self._get_platform(platform_id) is None:
-            return False, "平台实例未加载（UMO 中的平台 ID 不存在）"
-
-        timeout = max(1, self._int_conf("send_timeout", DEFAULT_TIMEOUT))
-        try:
-            chain = MessageChain().message(text)
-            found = await asyncio.wait_for(
-                self.context.send_message(umo, chain), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            return False, f"发送超时（>{timeout}s）"
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # 网络/接口错误
-            return False, f"{type(exc).__name__}: {exc}"[:120]
-
-        if found is False:
-            return False, "未找到匹配的平台实例"
-        return True, ""
-
-    # ------------------------------------------------------------------ #
-    # 广播主流程（手动 / 定时共用）
-    # ------------------------------------------------------------------ #
-    async def do_broadcast(
-        self,
-        message: str,
-        *,
-        origin_umo: str | None = None,
-        targets: list[dict[str, Any]] | None = None,
-        source: str = "manual",
-    ) -> BroadcastResult | None:
-        """执行一次全群广播。
-
-        Args:
-            message: 要发送的文本。
-            origin_umo: 结果回执发送到的会话；定时任务传 None。
-            targets: 预设目标列表；为 None 时重新解析。
-            source: manual / schedule，仅影响日志与回执标题。
-        """
-        message = (message or "").strip()
-        if not message:
-            return None
-
-        if self._busy:
-            if origin_umo:
-                await self._safe_send(
-                    origin_umo, "⏳ 已有广播任务正在执行，请稍后再试。"
-                )
-            return None
-
-        self._busy = True
-        started = time.monotonic()
-        try:
-            if targets is None:
-                await self._discover_from_platforms()
-                targets = self._resolve_targets()
-
-            result = BroadcastResult(total=len(targets))
-            if not targets:
-                if origin_umo:
-                    await self._safe_send(origin_umo, "⚠️ 没有可广播的群聊。")
-                return result
-
-            interval = max(0.0, self._float_conf("send_interval", DEFAULT_INTERVAL))
-            limiter = RateLimiter(
-                self._int_conf("max_per_minute", DEFAULT_MAX_PER_MINUTE)
-            )
-            logger.info(
-                f"[broadcast] 开始广播（{source}）：{len(targets)} 个群，"
-                f"间隔 {interval}s，限速 {limiter.max_per_minute or '不限'}/分钟"
-            )
-
-            for index, record in enumerate(targets):
-                umo = str(record.get("umo") or "")
-                if not umo:
-                    continue
-
-                if not self._quota_available():
-                    result.quota_blocked = True
-                    result.skipped.extend(
-                        str(item.get("umo") or "") for item in targets[index:]
-                    )
-                    logger.warning(
-                        f"[broadcast] 已达每日上限 {self._quota_limit()} 条，提前结束"
-                    )
-                    break
-
-                self._ensure_group_scene(umo)
-                await limiter.acquire()
-                ok, reason = await self._send_one(umo, message)
-                if ok:
-                    result.success += 1
-                    self._bump_quota()
-                else:
-                    result.failures.append((umo, reason))
-                    logger.warning(f"[broadcast] {umo} 发送失败：{reason}")
-
-                if interval > 0 and index < len(targets) - 1:
-                    await asyncio.sleep(interval)
-
-            result.elapsed = time.monotonic() - started
-            self._persist_state()
-            logger.info(
-                f"[broadcast] 广播结束：目标 {result.total}，成功 {result.success}，"
-                f"失败 {len(result.failures)}，跳过 {len(result.skipped)}，"
-                f"耗时 {result.elapsed:.1f}s"
-            )
-            if origin_umo:
-                await self._safe_send(origin_umo, self._format_report(result, source))
-            return result
-        finally:
-            self._busy = False
-
-    # ------------------------------------------------------------------ #
-    # 回执文本
-    # ------------------------------------------------------------------ #
-    def _format_report(self, result: BroadcastResult, source: str) -> str:
-        title = "📢 定时广播完成" if source == "schedule" else "📢 广播完成"
-        lines = [
-            title,
-            f"目标群：{result.total}",
-            f"成功：{result.success}",
-            f"失败：{len(result.failures)}",
-            f"耗时：{result.elapsed:.1f}s",
-        ]
-        if result.skipped:
-            reason = "每日额度已用尽" if result.quota_blocked else "未发送"
-            lines.append(f"跳过：{len(result.skipped)}（{reason}）")
-        if result.failures:
-            lines.append("")
-            lines.append("失败群聊：")
-            for umo, reason in result.failures[:15]:
-                lines.append(f"· {umo} → {reason}")
-            if len(result.failures) > 15:
-                lines.append(f"……其余 {len(result.failures) - 15} 个已省略")
-        return "\n".join(lines)
-
-    def _empty_targets_hint(self) -> str:
-        return (
-            "⚠️ 还没有登记任何群聊，广播无法发送。\n\n"
-            "群列表来源：\n"
-            "1. 机器人在某个群收到过任意消息后，该群会被自动登记；\n"
-            "2. 挂了 aiocqhttp（NapCat / Lagrange）时，可在插件配置里打开"
-            "「立即同步群列表」并保存；\n"
-            "3. 手动登记：/broadcast_add <平台ID>:GroupMessage:<群号>；\n"
-            "4. 查看已登记群：/broadcast_list。"
-        )
-
-    def _eta_text(self, count: int) -> str:
-        interval = max(0.0, self._float_conf("send_interval", DEFAULT_INTERVAL))
-        per_minute = self._int_conf("max_per_minute", DEFAULT_MAX_PER_MINUTE)
-        seconds = count * interval
-        if per_minute > 0:
-            seconds = max(seconds, count / per_minute * 60)
-        if seconds >= 60:
-            return f"{seconds / 60:.1f} 分钟"
-        return f"{seconds:.0f} 秒"
-
-    # ------------------------------------------------------------------ #
-    # 定时任务
-    # ------------------------------------------------------------------ #
-    def _setup_scheduler(self) -> None:
-        """根据配置重建定时任务；关闭时销毁调度器。"""
-        if not self._bool_conf("enable_schedule", False):
-            self._stop_scheduler()
-            return
-
-        if AsyncIOScheduler is None or CronTrigger is None:
-            logger.error("[broadcast] 未安装 apscheduler，无法启用定时广播")
-            return
-
-        cron = str(self._conf("schedule_cron", DEFAULT_CRON) or "").strip()
-        message = str(self._conf("schedule_message", "") or "").strip()
-        if not cron:
-            logger.warning("[broadcast] enable_schedule 已开启，但 schedule_cron 为空")
-            return
-        if not message:
-            logger.warning(
-                "[broadcast] enable_schedule 已开启，但 schedule_message 为空，"
-                "到点不会发送内容"
-            )
-
-        timezone = self._timezone()
-        try:
-            trigger = CronTrigger.from_crontab(cron, timezone=timezone)
-        except Exception as exc:
-            logger.error(f"[broadcast] Cron 表达式无效（{cron}）：{exc}")
-            # 表达式写错时停掉旧任务，避免按过期配置在错误时间群发
-            self._stop_scheduler()
-            return
-
-        if self._scheduler is None or not self._scheduler.running:
-            self._scheduler = AsyncIOScheduler(timezone=timezone)
-            self._scheduler.start()
-
-        self._scheduler.add_job(
-            self._run_scheduled_broadcast,
-            trigger=trigger,
-            id=SCHEDULE_JOB_ID,
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=600,
-        )
-        logger.info(
-            f"[broadcast] 定时广播已启用：{cron}，下次触发 {self._next_run_text()}"
-        )
-
-    def _stop_scheduler(self) -> None:
-        if self._scheduler is None:
-            return
-        with suppress(Exception):
-            if self._scheduler.running:
-                self._scheduler.shutdown(wait=False)
-        self._scheduler = None
-
-    def _next_run_text(self) -> str:
-        if self._scheduler is None:
-            return "未启用"
-        try:
-            job = self._scheduler.get_job(SCHEDULE_JOB_ID)
-            next_run = getattr(job, "next_run_time", None) if job else None
-        except Exception:
-            next_run = None
-        if not next_run:
-            return "未排期"
-        return next_run.strftime("%Y-%m-%d %H:%M:%S %Z")
-
-    async def _run_scheduled_broadcast(self) -> None:
-        message = str(self._conf("schedule_message", "") or "").strip()
-        if not message:
-            logger.warning("[broadcast] 定时广播触发，但 schedule_message 为空，已跳过")
-            return
-        logger.info("[broadcast] 定时广播触发")
-        try:
-            await self.do_broadcast(message, origin_umo=None, source="schedule")
-        except Exception:
-            logger.exception("[broadcast] 定时广播执行异常")
-
-    # ------------------------------------------------------------------ #
-    # 指令
-    # ------------------------------------------------------------------ #
     @staticmethod
     def _payload(event: AstrMessageEvent) -> str:
-        """取出指令名之后的全部文本（保留空格与换行）。
+        text = str(getattr(event, "message_str", "") or "")
+        return re.sub(r"^\s*/\S+\s*", "", text, count=1, flags=re.DOTALL).strip()
 
-        AstrBot 会把唤醒前缀从 message_str 中剥掉，所以这里只需去掉第一个词
-        （即指令名本身）。这样即使参数解析只拿到第一个 token，也能还原完整内容。
-        """
-        raw = str(getattr(event, "message_str", "") or "").strip()
-        if not raw:
-            return ""
-        match = re.match(r"^\S+\s*(.*)$", raw, re.DOTALL)
-        return match.group(1).strip() if match else raw
-
-    @filter.command("broadcast", alias={"广播"})
-    async def broadcast(self, event: AstrMessageEvent, content: str = ""):
-        """全群广播：/broadcast <消息内容>"""
-        if not self._is_admin(event):
-            yield event.plain_result(
-                "⚠️ 权限不足：仅管理员可使用广播指令。\n"
-                f"你的 UID：{self._sender_id(event)}\n"
-                "（把该 UID 加入插件配置 admin_uids 即可使用）"
+    async def _empty_targets_hint(self) -> str:
+        sessions = await self._collect_sessions()
+        if not sessions:
+            return (
+                "⚠️ 还没有发现任何会话，广播无法发送。\n\n"
+                "插件会从三个来源发现会话：\n"
+                "1. 机器人收到过消息的会话会被自动登记；\n"
+                "2. 平台适配器内存中的会话缓存；\n"
+                "3. AstrBot 数据库中的已知会话。\n\n"
+                "如果仍然为空：\n"
+                "· 让机器人在目标群/私聊里各收一条消息；\n"
+                "· 或挂载 aiocqhttp 后在插件配置页点「刷新会话」；\n"
+                "· 或在配置页把完整 UMO 手动加入白名单。"
             )
-            return
-
-        message = self._payload(event) or str(content or "").strip()
-        if not message:
-            yield event.plain_result(
-                "用法：/broadcast <消息内容>\n"
-                "例如：/broadcast 今晚 20:00 例行维护，预计 10 分钟"
-            )
-            return
-
-        if self._busy:
-            yield event.plain_result("⏳ 已有广播任务正在执行，请稍后再试。")
-            return
-
-        # 把发起指令的这个群也登记进去（首次使用场景）
-        if self._register_event_group(event):
-            self._save_registry()
-
-        await self._discover_from_platforms()
-        targets = self._resolve_targets()
-        if not targets:
-            yield event.plain_result(self._empty_targets_hint())
-            return
-
-        used = self._quota_used()
-        limit = self._quota_limit()
-        if limit > 0 and used >= limit:
-            yield event.plain_result(
-                f"⚠️ 今日主动消息额度已用尽（{used}/{limit}），"
-                "请明天再试或调整 daily_limit。"
-            )
-            return
-
-        yield event.plain_result(
-            f"🚀 开始广播\n目标群：{len(targets)}\n"
-            f"预计耗时：{self._eta_text(len(targets))}\n"
-            f"完成后会在本会话回执结果。"
+        return (
+            f"已知 {len(sessions)} 个会话，但都被白名单/排除名单过滤掉了。\n"
+            "请到插件配置页检查目标会话设置。"
         )
 
-        origin = event.unified_msg_origin
-        self._task = asyncio.create_task(
-            self.do_broadcast(
-                message, origin_umo=origin, targets=targets, source="manual"
-            )
-        )
-        self._task.add_done_callback(self._on_task_done)
-
-    @staticmethod
-    def _on_task_done(task: asyncio.Task) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc:
-            logger.error(f"[broadcast] 广播任务异常：{exc!r}")
-
-    @filter.command("broadcast_list")
-    async def broadcast_list(self, event: AstrMessageEvent):
-        """查看已登记的群聊列表"""
-        if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
-            return
-
-        await self._discover_from_platforms()
-        targets = self._resolve_targets()
-        if not targets:
-            yield event.plain_result(self._empty_targets_hint())
-            return
-
-        lines = [f"📋 已登记群聊：{len(targets)} 个（已按避开名单过滤）", ""]
-        for index, record in enumerate(targets, start=1):
-            group_id = str(record.get("group_id") or "")
-            platform_id = str(record.get("platform_id") or "")
-            lines.append(f"{index}. [{platform_id}] {group_id}")
-        excluded = len(self._groups) - len(targets)
-        if excluded > 0:
-            lines.append("")
-            lines.append(f"另有 {excluded} 个群被避开名单跳过")
-        yield event.plain_result("\n".join(lines))
-
-    @filter.command("broadcast_add")
-    async def broadcast_add(self, event: AstrMessageEvent, target: str = ""):
-        """手动登记一个群：/broadcast_add <平台ID>:GroupMessage:<群号>"""
-        if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
-            return
-
-        arg = (self._payload(event) or str(target or "")).strip()
-        if not arg:
-            yield event.plain_result(
-                "用法：/broadcast_add <平台ID>:GroupMessage:<群号>\n"
-                "例如：/broadcast_add qq_official:GroupMessage:ABC123\n"
-                f"当前已加载的平台：{self._platform_ids_text()}"
-            )
-            return
-
-        parts = arg.split(":", 2)
-        if len(parts) != 3 or not parts[0].strip() or not parts[2].strip():
-            yield event.plain_result(
-                "⚠️ UMO 格式不正确，必须写成 <平台ID>:GroupMessage:<群号>。\n"
-                "例如：/broadcast_add telegram:GroupMessage:-1001234567890\n"
-                f"当前已加载的平台：{self._platform_ids_text()}"
-            )
-            return
-
-        platform_id, message_type, group_id = (part.strip() for part in parts)
-        if message_type != GROUP_MESSAGE_TYPE:
-            yield event.plain_result(
-                f"⚠️ 只支持群聊会话，消息类型必须是 {GROUP_MESSAGE_TYPE}，"
-                f"收到的是 `{message_type}`。"
-            )
-            return
-        if self._get_platform(platform_id) is None:
-            yield event.plain_result(
-                f"⚠️ 平台 `{platform_id}` 未加载，请检查 UMO 第一段是否填写正确。\n"
-                f"当前已加载的平台：{self._platform_ids_text()}"
-            )
-            return
-
-        umo = f"{platform_id}:{GROUP_MESSAGE_TYPE}:{group_id}"
-        self._upsert_group(umo)
-        self._save_registry()
-        yield event.plain_result(
-            f"✅ 已登记群聊：{umo}\n当前共 {len(self._groups)} 个群。"
-        )
-
-    def _platform_ids_text(self) -> str:
-        ids = []
-        for instance in self._platform_instances():
-            try:
-                platform_id = str(getattr(instance.meta(), "id", "") or "")
-            except Exception:
-                continue
-            if platform_id:
-                ids.append(platform_id)
-        return "、".join(ids) if ids else "（暂无）"
-
-    @filter.command("broadcast_remove")
-    async def broadcast_remove(self, event: AstrMessageEvent, target: str = ""):
-        """移除一个群：/broadcast_remove <平台ID>:GroupMessage:<群号>"""
-        if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
-            return
-
-        arg = (self._payload(event) or str(target or "")).strip()
-        if not arg:
-            yield event.plain_result(
-                "用法：/broadcast_remove <平台ID>:GroupMessage:<群号>\n"
-                "例如：/broadcast_remove qq_official:GroupMessage:ABC123"
-            )
-            return
-
-        if arg.count(":") >= 2:
-            matched = [arg] if arg in self._groups else []
-        else:
-            # 纯群号只作为过滤条件，不推断平台；多平台同号时要求写全 UMO
-            matched = [
-                umo
-                for umo, record in self._groups.items()
-                if str(record.get("group_id") or "") == arg
-            ]
-            if len(matched) > 1:
-                yield event.plain_result(
-                    f"⚠️ 群号 `{arg}` 在多个平台下都存在，请用完整 UMO 指定：\n"
-                    + "\n".join(f"· {umo}" for umo in matched)
-                )
-                return
-
-        if not matched:
-            yield event.plain_result(f"⚠️ 未找到匹配的群：{arg}")
-            return
-
-        for umo in matched:
-            self._groups.pop(umo, None)
-        self._save_registry()
-        yield event.plain_result(
-            "✅ 已移除：\n" + "\n".join(f"· {umo}" for umo in matched)
-        )
-
-    @filter.command("broadcast_status")
-    async def broadcast_status(self, event: AstrMessageEvent):
-        """查看广播插件状态"""
-        if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
-            return
-
-        limit = self._quota_limit()
-        used = self._quota_used()
-        quota = f"{used}/{limit}" if limit > 0 else f"{used}/不限"
-        schedule_on = self._bool_conf("enable_schedule", False)
+    def _format_report(self, result: BroadcastResult) -> str:
         lines = [
-            "📡 广播插件状态",
-            f"已登记群聊：{len(self._groups)}",
-            f"避开名单：{len(self._str_list_conf('exclude_umos'))}",
-            f"今日已发送：{quota}（{self._today()}）",
-            f"发送间隔：{self._float_conf('send_interval', DEFAULT_INTERVAL)}s，"
-            "限速："
-            f"{self._int_conf('max_per_minute', DEFAULT_MAX_PER_MINUTE) or '不限'}"
-            "/分钟",
-            f"定时广播：{'开启' if schedule_on else '关闭'}",
-            "群列表同步："
-            + ("aiocqhttp 可用" if self._aiocqhttp_instances() else "未挂载 aiocqhttp"),
+            "📢 广播完成",
+            f"目标：{result.total} 个｜成功：{result.success}｜失败：{result.failed}",
         ]
-        if schedule_on:
-            cron = str(self._conf("schedule_cron", DEFAULT_CRON) or "").strip()
-            lines.append(f"Cron：{cron}")
-            lines.append(f"下次触发：{self._next_run_text()}")
-        yield event.plain_result("\n".join(lines))
-
-    @filter.command("broadcast_reload")
-    async def broadcast_reload(self, event: AstrMessageEvent):
-        """按当前配置重建定时任务"""
-        if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
-            return
-
-        try:
-            self._setup_scheduler()
-        except Exception as exc:
-            yield event.plain_result(f"❌ 重建定时任务失败：{exc}")
-            return
-
-        if self._bool_conf("enable_schedule", False):
-            yield event.plain_result(
-                f"✅ 定时任务已按当前配置重建\n"
-                f"Cron：{self._conf('schedule_cron', DEFAULT_CRON)}\n"
-                f"下次触发：{self._next_run_text()}"
+        if result.skipped:
+            lines.append(f"跳过：{result.skipped}（今日额度已用尽）")
+        if result.duration:
+            lines.append(f"耗时：{result.duration:.1f} 秒")
+        if result.missing_targets:
+            lines.append(
+                f"⚠️ 白名单中 {len(result.missing_targets)} 个 UMO 未在会话列表中发现，"
+                "已尝试直接发送"
             )
-        else:
-            yield event.plain_result("✅ 定时广播当前为关闭状态，已停止调度器。")
-
-    # ------------------------------------------------------------------ #
-    # 生命周期
-    # ------------------------------------------------------------------ #
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=100)
-    async def record_group(self, event: AstrMessageEvent):
-        """被动记录收到过消息的群，作为广播目标来源。"""
-        try:
-            if self._register_event_group(event):
-                self._save_registry()
-        except Exception as exc:
-            logger.debug(f"[broadcast] 记录群聊失败：{exc}")
-
-    @filter.on_astrbot_loaded()
-    async def on_astrbot_loaded(self):
-        """AstrBot 全部加载完成后校准一次定时任务。"""
-        try:
-            self._setup_scheduler()
-        except Exception:
-            logger.exception("[broadcast] on_astrbot_loaded 重建定时任务失败")
+        if result.failures:
+            lines.append("失败明细（最多 10 条）：")
+            for umo, reason in result.failures[:10]:
+                lines.append(f"· {umo} → {reason}")
+            if len(result.failures) > 10:
+                lines.append(f"…… 另有 {len(result.failures) - 10} 条失败未显示")
+        return "\n".join(lines)
 
     async def terminate(self):
-        """插件卸载/停用时释放资源。"""
-        self._stop_scheduler()
-        if self._task and not self._task.done():
-            self._task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await self._task
+        """插件卸载/重载时清理定时器与后台任务。"""
+        self._shutdown_scheduler()
+        for task in (self._task, self._flush_task):
+            if task and not task.done():
+                task.cancel()
         self._save_registry()
-        self._persist_state()
-        logger.info("[broadcast] 插件已卸载")
+        self._save_state()
+
+
+def _split_umo(umo: str) -> tuple[str, str, str]:
+    parts = umo.split(":", 2)
+    if len(parts) < 3:
+        return (parts[0] if parts else "", parts[1] if len(parts) > 1 else "", umo)
+    return parts[0], parts[1], parts[2]
+
+
+def _cron_to_schedule(cron: str) -> ScheduleSettings | None:
+    """把常见的 5 段 Cron 反解成可视化配置（迁移旧配置用）。"""
+    fields = cron.split()
+    if len(fields) != 5:
+        return None
+    minute, hour, dom, month, dow = fields
+    if not (minute.isdigit() and hour.isdigit()):
+        return None
+    if dom != "*" or month != "*":
+        return None
+    time_str = f"{int(hour):02d}:{int(minute):02d}"
+    if dow == "*":
+        return ScheduleSettings(mode="daily", time=time_str)
+    days: list[int] = []
+    for item in dow.split(","):
+        part = item.strip()
+        if part.isdigit() and 0 <= int(part) <= 6:
+            days.append(int(part))
+    if not days:
+        return None
+    return ScheduleSettings(mode="weekly", time=time_str, weekdays=sorted(set(days)))

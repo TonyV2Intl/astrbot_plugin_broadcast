@@ -1,2 +1,3 @@
-# AstrBot 本体已内置 apscheduler（telegram 适配器依赖），此处仅作显式声明
-apscheduler>=3.10.0
+# AstrBot 本体已内置 apscheduler 与 SQLAlchemy，此处仅作显式声明
+apscheduler>=3.10,<4
+SQLAlchemy>=2.0
