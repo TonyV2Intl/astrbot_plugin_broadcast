@@ -70,6 +70,13 @@
     "description": "自动登记群聊",
     "type": "bool",
     "default": true,
-    "hint": "QQ 官方机器人没有“查询全部已加入群”的接口，因此插件会自动记录机器人收到过消息的群。关闭后只能手动 /broadcast_add 添加。"
+    "hint": "开启后，机器人收到过消息的群会自动写入群表，无需手动登记。关闭后只能通过「立即同步群列表」或 /broadcast_add 添加。"
+  },
+  "sync_groups_now": {
+    "description": "立即同步群列表（仅 aiocqhttp 可用）",
+    "type": "bool",
+    "default": false,
+    "hint": "打开并保存后，插件会立刻调用 aiocqhttp（NapCat / Lagrange）的 get_group_list 拉取全部群并写入群表，完成后开关自动复位为关闭。QQ 官方适配器没有群列表接口，未挂载 aiocqhttp 时打开无效。",
+    "obvious_hint": true
   }
 }

@@ -1,19 +1,19 @@
-"""AstrBot 全群广播插件（重点适配 QQ 官方机器人）。
+"""AstrBot 全群广播插件。
 
 命令：
-    /broadcast <消息内容>          向所有已登记群聊广播
-    /broadcast_list                查看已登记的群聊
-    /broadcast_add <UMO|群号>      手动登记一个群
-    /broadcast_remove <UMO|群号>   移除一个群
-    /broadcast_status              查看额度、限速与定时任务状态
-    /broadcast_reload              按当前配置重建定时任务
+    /broadcast <消息内容>                        向所有已登记群聊广播
+    /broadcast_list                              查看已登记的群聊
+    /broadcast_add <平台ID>:GroupMessage:<群号>   手动登记一个群
+    /broadcast_remove <平台ID>:GroupMessage:<群号> 移除一个群
+    /broadcast_status                            查看额度、限速与定时任务状态
+    /broadcast_reload                            按当前配置重建定时任务
 
 说明：
-    QQ 官方机器人开放平台没有“查询机器人已加入的全部群”的接口
-    （只有 /v2/groups/{group_openid}/info 这类单群查询），因此本插件采用
-    “动态登记 + 本地持久化”的方式维护群列表：
+    群列表采用“动态登记 + 本地持久化”的方式维护，登记时统一使用 AstrBot 的
+    规范化 UMO：<平台ID>:GroupMessage:<群号>，不按平台做任何推断。
       1. 机器人收到任意群消息时，自动记录该群的 UMO；
-      2. aiocqhttp（NapCat / Lagrange 等）可直接调用 get_group_list 接口同步；
+      2. 挂了 aiocqhttp（NapCat / Lagrange 等）时，可在插件配置里打开
+         「立即同步群列表」并保存，插件会调用 get_group_list 拉取全量群；
       3. 也可以通过 /broadcast_add 手动登记。
 """
 
@@ -57,6 +57,7 @@ DEFAULT_MAX_PER_MINUTE = 20
 DEFAULT_TIMEOUT = 20
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_CRON = "0 9 * * *"
+SYNC_WAIT_SECONDS = 15
 
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +151,7 @@ class OfficialBroadcastPlugin(Star):
         self._state: dict[str, Any] = {"date": "", "sent": 0}
         self._busy = False
         self._task: asyncio.Task | None = None
+        self._sync_task: asyncio.Task | None = None
         self._scheduler: Any = None
 
         self._load_registry()
@@ -160,6 +162,14 @@ class OfficialBroadcastPlugin(Star):
             self._setup_scheduler()
         except Exception:
             logger.exception("[broadcast] 初始化定时任务失败")
+
+        # 配置页的「立即同步群列表」是开关式触发器：保存配置会热重载插件，
+        # 加载时发现开关为 true 就执行一次同步，并把开关复位。
+        if self._bool_conf("sync_groups_now", False):
+            try:
+                self._sync_task = asyncio.create_task(self._consume_sync_trigger())
+            except RuntimeError:
+                logger.warning("[broadcast] 当前没有事件循环，跳过群列表同步触发")
 
     # ------------------------------------------------------------------ #
     # 初始化辅助
@@ -391,7 +401,7 @@ class OfficialBroadcastPlugin(Star):
             scenes.setdefault(session_id, "group")
 
     async def _discover_from_platforms(self) -> None:
-        """从运行中的平台实例补充群列表。"""
+        """从运行中的平台实例补充群列表（只读取适配器内存中已见过的群会话）。"""
         if not self._bool_conf("auto_discover", True):
             return
         try:
@@ -405,11 +415,10 @@ class OfficialBroadcastPlugin(Star):
             try:
                 meta = instance.meta()
                 platform_id = str(getattr(meta, "id", "") or "")
-                platform_name = str(getattr(meta, "name", "") or "")
             except Exception:
                 continue
 
-            # 1) 适配器内存中见过的群会话（QQ 官方适配器会记录 scene）
+            # 适配器内存中见过的群会话（QQ 官方适配器会记录 scene）
             scenes = getattr(instance, "_session_scene", None)
             if isinstance(scenes, dict):
                 for session_id, scene in list(scenes.items()):
@@ -419,12 +428,78 @@ class OfficialBroadcastPlugin(Star):
                         f"{platform_id}:{GROUP_MESSAGE_TYPE}:{session_id}"
                     )
 
-            # 2) aiocqhttp 协议端可以直接拉群列表
-            if platform_name == "aiocqhttp":
-                changed |= await self._discover_aiocqhttp(instance, platform_id)
-
         if changed:
             self._save_registry()
+
+    def _platform_instances(self) -> list[Any]:
+        try:
+            return list(self.context.platform_manager.get_insts())
+        except Exception:
+            return []
+
+    def _aiocqhttp_instances(self) -> list[tuple[str, Any]]:
+        """返回 (平台实例 ID, 实例) 的 aiocqhttp 列表。"""
+        found: list[tuple[str, Any]] = []
+        for instance in self._platform_instances():
+            try:
+                meta = instance.meta()
+            except Exception:
+                continue
+            if str(getattr(meta, "name", "") or "") != "aiocqhttp":
+                continue
+            platform_id = str(getattr(meta, "id", "") or "")
+            if platform_id:
+                found.append((platform_id, instance))
+        return found
+
+    async def _consume_sync_trigger(self) -> None:
+        """消费配置页的「立即同步群列表」开关。
+
+        配置页没有可点击按钮，保存配置会热重载本插件，所以用 bool 开关当触发器：
+        加载时读到 true 就复位开关，然后等平台实例就绪，调用 aiocqhttp 的
+        get_group_list 把群写进群表。
+        """
+        self._reset_sync_flag()
+
+        if not self._aiocqhttp_instances() and not self._platform_instances():
+            # 插件可能先于平台加载，给平台连接留一点时间
+            for _ in range(SYNC_WAIT_SECONDS):
+                await asyncio.sleep(1)
+                if self._aiocqhttp_instances():
+                    break
+
+        instances = self._aiocqhttp_instances()
+        if not instances:
+            logger.warning(
+                "[broadcast] 群列表同步已跳过：没有已加载的 aiocqhttp 实例"
+                "（该功能仅 aiocqhttp 可用）"
+            )
+            return
+
+        before = len(self._groups)
+        for platform_id, instance in instances:
+            await self._discover_aiocqhttp(instance, platform_id)
+        added = len(self._groups) - before
+        if added:
+            self._save_registry()
+        logger.info(
+            f"[broadcast] 群列表同步完成：{len(instances)} 个 aiocqhttp 实例，"
+            f"新增 {added} 个群，当前共 {len(self._groups)} 个群"
+        )
+
+    def _reset_sync_flag(self) -> None:
+        """把触发开关复位，避免下次重载重复同步。"""
+        try:
+            if not isinstance(self.config, dict):
+                return
+            if not self.config.get("sync_groups_now"):
+                return
+            self.config["sync_groups_now"] = False
+            save = getattr(self.config, "save_config", None)
+            if callable(save):
+                save()
+        except Exception as exc:
+            logger.warning(f"[broadcast] 复位「立即同步」开关失败：{exc}")
 
     async def _discover_aiocqhttp(self, instance: Any, platform_id: str) -> bool:
         try:
@@ -658,10 +733,12 @@ class OfficialBroadcastPlugin(Star):
     def _empty_targets_hint(self) -> str:
         return (
             "⚠️ 还没有登记任何群聊，广播无法发送。\n\n"
-            "QQ 官方机器人没有“查询全部已加入群”的接口，插件通过以下方式获取群：\n"
+            "群列表来源：\n"
             "1. 机器人在某个群收到过任意消息后，该群会被自动登记；\n"
-            "2. 手动登记：/broadcast_add <群号或完整 UMO>；\n"
-            "3. 查看已登记群：/broadcast_list。"
+            "2. 挂了 aiocqhttp（NapCat / Lagrange）时，可在插件配置里打开"
+            "「立即同步群列表」并保存；\n"
+            "3. 手动登记：/broadcast_add <平台ID>:GroupMessage:<群号>；\n"
+            "4. 查看已登记群：/broadcast_list。"
         )
 
     def _eta_text(self, count: int) -> str:
@@ -861,7 +938,7 @@ class OfficialBroadcastPlugin(Star):
 
     @filter.command("broadcast_add")
     async def broadcast_add(self, event: AstrMessageEvent, target: str = ""):
-        """手动登记一个群：/broadcast_add <UMO|群号>"""
+        """手动登记一个群：/broadcast_add <平台ID>:GroupMessage:<群号>"""
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
             return
@@ -869,75 +946,83 @@ class OfficialBroadcastPlugin(Star):
         arg = (self._payload(event) or str(target or "")).strip()
         if not arg:
             yield event.plain_result(
-                "用法：/broadcast_add <完整 UMO 或群号>\n"
+                "用法：/broadcast_add <平台ID>:GroupMessage:<群号>\n"
                 "例如：/broadcast_add qq_official:GroupMessage:ABC123\n"
-                "或：  /broadcast_add 123456789"
+                f"当前已加载的平台：{self._platform_ids_text()}"
             )
             return
 
-        if arg.count(":") >= 2:
-            umo = arg
-            platform_id = arg.split(":", 1)[0]
-            if self._get_platform(platform_id) is None:
-                yield event.plain_result(
-                    f"⚠️ UMO 中的平台 ID `{platform_id}` 未加载，请检查是否填写正确。"
-                )
-                return
-        else:
-            platform_id = self._guess_platform_id()
-            if not platform_id:
-                yield event.plain_result(
-                    "⚠️ 没有可用的平台实例，请提供完整 UMO（平台ID:GroupMessage:群号）。"
-                )
-                return
-            umo = f"{platform_id}:{GROUP_MESSAGE_TYPE}:{arg}"
+        parts = arg.split(":", 2)
+        if len(parts) != 3 or not parts[0].strip() or not parts[2].strip():
+            yield event.plain_result(
+                "⚠️ UMO 格式不正确，必须写成 <平台ID>:GroupMessage:<群号>。\n"
+                "例如：/broadcast_add telegram:GroupMessage:-1001234567890\n"
+                f"当前已加载的平台：{self._platform_ids_text()}"
+            )
+            return
 
+        platform_id, message_type, group_id = (part.strip() for part in parts)
+        if message_type != GROUP_MESSAGE_TYPE:
+            yield event.plain_result(
+                f"⚠️ 只支持群聊会话，消息类型必须是 {GROUP_MESSAGE_TYPE}，"
+                f"收到的是 `{message_type}`。"
+            )
+            return
+        if self._get_platform(platform_id) is None:
+            yield event.plain_result(
+                f"⚠️ 平台 `{platform_id}` 未加载，请检查 UMO 第一段是否填写正确。\n"
+                f"当前已加载的平台：{self._platform_ids_text()}"
+            )
+            return
+
+        umo = f"{platform_id}:{GROUP_MESSAGE_TYPE}:{group_id}"
         self._upsert_group(umo)
         self._save_registry()
         yield event.plain_result(
             f"✅ 已登记群聊：{umo}\n当前共 {len(self._groups)} 个群。"
         )
 
-    def _guess_platform_id(self) -> str:
-        try:
-            instances = self.context.platform_manager.get_insts()
-        except Exception:
-            return ""
-        candidates: list[str] = []
-        for instance in instances:
+    def _platform_ids_text(self) -> str:
+        ids = []
+        for instance in self._platform_instances():
             try:
-                meta = instance.meta()
+                platform_id = str(getattr(instance.meta(), "id", "") or "")
             except Exception:
                 continue
-            name = str(getattr(meta, "name", "") or "")
-            platform_id = str(getattr(meta, "id", "") or "")
-            if not platform_id:
-                continue
-            if name in {"qq_official", "qq_official_webhook", "aiocqhttp"}:
-                return platform_id
-            candidates.append(platform_id)
-        return candidates[0] if candidates else ""
+            if platform_id:
+                ids.append(platform_id)
+        return "、".join(ids) if ids else "（暂无）"
 
     @filter.command("broadcast_remove")
     async def broadcast_remove(self, event: AstrMessageEvent, target: str = ""):
-        """移除一个群：/broadcast_remove <UMO|群号>"""
+        """移除一个群：/broadcast_remove <平台ID>:GroupMessage:<群号>"""
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
             return
 
         arg = (self._payload(event) or str(target or "")).strip()
         if not arg:
-            yield event.plain_result("用法：/broadcast_remove <完整 UMO 或群号>")
+            yield event.plain_result(
+                "用法：/broadcast_remove <平台ID>:GroupMessage:<群号>\n"
+                "例如：/broadcast_remove qq_official:GroupMessage:ABC123"
+            )
             return
 
         if arg.count(":") >= 2:
             matched = [arg] if arg in self._groups else []
         else:
+            # 纯群号只作为过滤条件，不推断平台；多平台同号时要求写全 UMO
             matched = [
                 umo
                 for umo, record in self._groups.items()
                 if str(record.get("group_id") or "") == arg
             ]
+            if len(matched) > 1:
+                yield event.plain_result(
+                    f"⚠️ 群号 `{arg}` 在多个平台下都存在，请用完整 UMO 指定：\n"
+                    + "\n".join(f"· {umo}" for umo in matched)
+                )
+                return
 
         if not matched:
             yield event.plain_result(f"⚠️ 未找到匹配的群：{arg}")
@@ -971,6 +1056,8 @@ class OfficialBroadcastPlugin(Star):
             f"{self._int_conf('max_per_minute', DEFAULT_MAX_PER_MINUTE) or '不限'}"
             "/分钟",
             f"定时广播：{'开启' if schedule_on else '关闭'}",
+            "群列表同步："
+            + ("aiocqhttp 可用" if self._aiocqhttp_instances() else "未挂载 aiocqhttp"),
         ]
         if schedule_on:
             cron = str(self._conf("schedule_cron", DEFAULT_CRON) or "").strip()
