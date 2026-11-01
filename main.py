@@ -708,7 +708,11 @@ class OfficialBroadcastPlugin(Star):
         return mapping
 
     def _adapter_sessions(self) -> list[dict[str, str]]:
-        """读取平台适配器内存中的会话缓存（只做鸭子类型探测）。"""
+        """读取平台适配器内存中的会话缓存（只做鸭子类型探测）。
+
+        AstrBot 没有公开的「枚举适配器已知会话」接口，这里只读探测
+        ``_session_scene``；字段不存在或改名时返回空列表，不影响其它来源。
+        """
         try:
             instances = self.context.platform_manager.get_insts()
         except Exception:
@@ -737,6 +741,11 @@ class OfficialBroadcastPlugin(Star):
 
         三张表分别查询：旧版本可能还没有 umo_aliases，单表缺失不应
         影响其它来源。
+
+        这里保持只读 SELECT，不经过 ConversationManager：它的
+        ``get_conversations()`` 只覆盖「有对话记录的会话」，底层同样落在
+        conversations 表上，而显示名仍要读 umo_aliases，换过去既不会减少
+        耦合也不会提高覆盖率。全部语句均为 SELECT，不写任何表。
         """
         if not SQLALCHEMY_AVAILABLE:
             return []
@@ -901,8 +910,11 @@ class OfficialBroadcastPlugin(Star):
     def _ensure_group_scene(self, session: SessionInfo) -> None:
         """预热 QQ 官方适配器的会话场景缓存。
 
-        QQ 官方适配器在缺少 msg_id 时，只有 ``_session_scene`` 记录为
-        group 才允许主动群发；该缓存在重启后为空，会导致消息被静默丢弃。
+        QQ 官方适配器在缺少 msg_id 时，只有会话场景记录为 group 才允许
+        主动群发；该缓存在重启后为空，会导致消息被静默丢弃。
+
+        使用适配器公开的 ``remember_session_scene``（4.24.2 起提供），
+        不触碰内部缓存字段。
         """
         if session.message_type != GROUP_MESSAGE_TYPE:
             return
@@ -910,9 +922,20 @@ class OfficialBroadcastPlugin(Star):
             platform = self.context.get_platform_inst(session.platform)
         except Exception:
             return
-        scenes = getattr(platform, "_session_scene", None) if platform else None
-        if isinstance(scenes, dict):
-            scenes.setdefault(session.session_id, "group")
+        if platform is None:
+            return
+
+        remember = getattr(platform, "remember_session_scene", None)
+        if not callable(remember):
+            logger.debug(
+                f"[broadcast] 平台 {session.platform} 不支持会话场景预热，"
+                "主动群发可能被平台丢弃"
+            )
+            return
+        try:
+            remember(session.session_id, "group")
+        except Exception as exc:
+            logger.debug(f"[broadcast] 设置会话场景失败：{exc}")
 
     async def _send_one(self, session: SessionInfo, message: str) -> tuple[bool, str]:
         self._ensure_group_scene(session)
