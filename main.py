@@ -33,10 +33,11 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -49,11 +50,13 @@ from astrbot.api.web import error_response, json_response, request
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.date import DateTrigger
 
     SCHEDULER_AVAILABLE = True
 except Exception:  # pragma: no cover - 未安装依赖
     AsyncIOScheduler = None  # type: ignore[assignment]
     CronTrigger = None  # type: ignore[assignment]
+    DateTrigger = None  # type: ignore[assignment]
     SCHEDULER_AVAILABLE = False
 
 try:
@@ -66,7 +69,7 @@ except Exception:  # pragma: no cover - 未安装依赖
 
 
 PLUGIN_NAME = "astrbot_plugin_broadcast"
-SCHEDULE_JOB_ID = "broadcast_cron"
+JOB_PREFIX = "broadcast_task_"
 GROUP_MESSAGE_TYPE = "GroupMessage"
 
 DEFAULT_INTERVAL = 2.0
@@ -74,10 +77,10 @@ DEFAULT_MAX_PER_MINUTE = 20
 DEFAULT_DAILY_LIMIT = 1000
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_TIME = "09:00"
-DEFAULT_WEEKDAYS = [0, 1, 2, 3, 4, 5, 6]
 
 MAX_INTERVAL = 60.0
 MAX_MESSAGE_LENGTH = 4000
+MAX_SCHEDULES = 20
 REGISTRY_FLUSH_DELAY = 5.0
 DB_UMO_LIMIT = 5000
 
@@ -85,9 +88,12 @@ DB_UMO_LIMIT = 5000
 NON_BROADCAST_PLATFORMS = {"webchat", "unknown", ""}
 
 WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+WEEKDAY_CRON = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 _UMO_RE = re.compile(r"^[^:\s]+:[^:\s]+:.+$")
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
 class SettingsError(ValueError):
@@ -98,50 +104,82 @@ class SettingsError(ValueError):
 # 配置模型
 # --------------------------------------------------------------------------- #
 @dataclass
-class ScheduleSettings:
-    """定时广播的可视化配置（由后端编译成 Cron）。"""
+class ScheduleTask:
+    """一条定时广播计划。
 
-    mode: str = "daily"  # daily | weekly
+    ``mode`` 决定重复方式：
+        daily   每天 HH:MM
+        weekly  每周选中的星期 HH:MM
+        once    指定日期 HH:MM 只执行一次（像闹钟，触发后自动停用）
+    """
+
+    id: str = ""
+    message: str = ""
+    enabled: bool = True
+    mode: str = "daily"
     time: str = DEFAULT_TIME
-    weekdays: list[int] = field(default_factory=lambda: list(DEFAULT_WEEKDAYS))
+    weekdays: list[int] = field(default_factory=list)
+    date: str = ""
+    last_fired: str = ""
 
-    def to_cron(self) -> str:
-        hour, minute = self.time.split(":")
-        if self.mode == "weekly":
-            days = sorted({d for d in self.weekdays if 0 <= d <= 6})
-            if not days:
-                raise SettingsError("每周模式至少要选择一天")
-            day_of_week = ",".join(str(d) for d in days)
-        else:
-            day_of_week = "*"
-        return f"{int(minute)} {int(hour)} * * {day_of_week}"
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = new_task_id()
+
+    @property
+    def job_id(self) -> str:
+        return f"{JOB_PREFIX}{self.id}"
 
     def describe(self) -> str:
         if self.mode == "weekly":
             days = "、".join(WEEKDAY_LABELS[d] for d in sorted(set(self.weekdays)))
             return f"每周 {days} {self.time}"
+        if self.mode == "once":
+            return f"{self.date or '未选日期'} {self.time} 仅一次"
         return f"每天 {self.time}"
+
+    def run_at(self, tz: Any) -> datetime | None:
+        """一次性任务的下次触发时刻；其他模式返回 None。"""
+        if self.mode != "once" or not self.date:
+            return None
+        hour, minute = (int(part) for part in self.time.split(":"))
+        year, month, day = (int(part) for part in self.date.split("-"))
+        return datetime(year, month, day, hour, minute, tzinfo=tz)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.id,
+            "message": self.message,
+            "enabled": self.enabled,
             "mode": self.mode,
             "time": self.time,
             "weekdays": list(self.weekdays),
+            "date": self.date,
+            "last_fired": self.last_fired,
         }
 
     @classmethod
-    def from_dict(cls, raw: Any, base: ScheduleSettings | None = None):
+    def from_dict(cls, raw: Any, base: ScheduleTask | None = None) -> ScheduleTask:
         base = base or cls()
-        if raw is None:
-            return base
         if not isinstance(raw, dict):
-            raise SettingsError("schedule 必须是对象")
+            raise SettingsError("定时任务必须是对象")
+
+        task_id = str(raw.get("id", base.id) or "").strip()
+        if not _ID_RE.match(task_id):
+            task_id = new_task_id()
+
+        message = str(raw.get("message", base.message) or "")
+        if len(message) > MAX_MESSAGE_LENGTH:
+            raise SettingsError(f"定时消息不能超过 {MAX_MESSAGE_LENGTH} 字")
+
         mode = str(raw.get("mode", base.mode) or base.mode).strip().lower()
-        if mode not in {"daily", "weekly"}:
-            raise SettingsError("定时模式只支持 daily 或 weekly")
+        if mode not in {"daily", "weekly", "once"}:
+            raise SettingsError("重复方式只支持 daily / weekly / once")
+
         time_str = str(raw.get("time", base.time) or base.time).strip()
         if not _TIME_RE.match(time_str):
             raise SettingsError(f"时间格式无效：{time_str}（应为 HH:MM）")
+
         raw_days = raw.get("weekdays", base.weekdays)
         days: list[int] = []
         if isinstance(raw_days, list):
@@ -155,7 +193,51 @@ class ScheduleSettings:
         days.sort()
         if mode == "weekly" and not days:
             raise SettingsError("每周模式至少要选择一天")
-        return cls(mode=mode, time=time_str, weekdays=days or list(DEFAULT_WEEKDAYS))
+
+        date_str = str(raw.get("date", base.date) or "").strip()
+        if mode == "once":
+            if not _DATE_RE.match(date_str):
+                raise SettingsError("仅一次任务需要选择日期（YYYY-MM-DD）")
+            try:
+                datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError as exc:
+                raise SettingsError(f"日期无效：{date_str}") from exc
+
+        last_fired = str(raw.get("last_fired", base.last_fired) or "")
+
+        return cls(
+            id=task_id,
+            message=message,
+            enabled=bool(raw.get("enabled", base.enabled)),
+            mode=mode,
+            time=time_str,
+            weekdays=days,
+            date=date_str,
+            last_fired=last_fired,
+        )
+
+
+def new_task_id() -> str:
+    """生成短且可读的任务 ID。"""
+    return f"t{secrets.token_hex(3)}"
+
+
+def _parse_schedules(raw: Any, base: list[ScheduleTask]) -> list[ScheduleTask]:
+    if raw is None:
+        return list(base)
+    if not isinstance(raw, list):
+        raise SettingsError("schedules 必须是数组")
+    if len(raw) > MAX_SCHEDULES:
+        raise SettingsError(f"最多只能添加 {MAX_SCHEDULES} 个定时任务")
+    tasks: list[ScheduleTask] = []
+    seen: set[str] = set()
+    for item in raw:
+        task = ScheduleTask.from_dict(item)
+        if task.id in seen:
+            task.id = new_task_id()
+        seen.add(task.id)
+        tasks.append(task)
+    return tasks
 
 
 @dataclass
@@ -168,9 +250,7 @@ class Settings:
     send_interval: float = DEFAULT_INTERVAL
     max_per_minute: int = DEFAULT_MAX_PER_MINUTE
     daily_limit: int = DEFAULT_DAILY_LIMIT
-    enable_schedule: bool = False
-    schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
-    schedule_message: str = ""
+    schedules: list[ScheduleTask] = field(default_factory=list)
     timezone: str = DEFAULT_TIMEZONE
     auto_register: bool = True
 
@@ -183,9 +263,7 @@ class Settings:
             "send_interval": self.send_interval,
             "max_per_minute": self.max_per_minute,
             "daily_limit": self.daily_limit,
-            "enable_schedule": self.enable_schedule,
-            "schedule": self.schedule.to_dict(),
-            "schedule_message": self.schedule_message,
+            "schedules": [task.to_dict() for task in self.schedules],
             "timezone": self.timezone,
             "auto_register": self.auto_register,
         }
@@ -220,17 +298,9 @@ class Settings:
         if daily_limit < 0 or daily_limit > 1_000_000:
             raise SettingsError("每日额度需在 0~1000000 之间（0 表示不限）")
 
-        message = str(raw.get("schedule_message", base.schedule_message) or "")
-        if len(message) > MAX_MESSAGE_LENGTH:
-            raise SettingsError(f"定时消息不能超过 {MAX_MESSAGE_LENGTH} 字")
-
         timezone = str(raw.get("timezone", base.timezone) or DEFAULT_TIMEZONE).strip()
         if not _valid_timezone(timezone):
             raise SettingsError(f"时区无效：{timezone}")
-
-        schedule = ScheduleSettings.from_dict(
-            raw.get("schedule", base.schedule.to_dict()), base.schedule
-        )
 
         return cls(
             admin_uids=admin_uids,
@@ -239,9 +309,7 @@ class Settings:
             send_interval=round(interval, 2),
             max_per_minute=max_per_minute,
             daily_limit=daily_limit,
-            enable_schedule=bool(raw.get("enable_schedule", base.enable_schedule)),
-            schedule=schedule,
-            schedule_message=message,
+            schedules=_parse_schedules(raw.get("schedules"), base.schedules),
             timezone=timezone,
             auto_register=bool(raw.get("auto_register", base.auto_register)),
         )
@@ -249,8 +317,8 @@ class Settings:
     def replace(self, **kwargs: Any) -> Settings:
         data = self.to_dict()
         for key, value in kwargs.items():
-            if key == "schedule" and isinstance(value, ScheduleSettings):
-                data["schedule"] = value.to_dict()
+            if key == "schedules" and value is not None:
+                data["schedules"] = [task.to_dict() for task in value]
             else:
                 data[key] = value
         return Settings.from_dict(data)
@@ -309,6 +377,16 @@ def _valid_timezone(name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _short_time(iso: str) -> str:
+    """把 ISO 时间压成「MM-DD HH:MM」，取不到就原样返回。"""
+    if not iso:
+        return ""
+    try:
+        return datetime.fromisoformat(iso).strftime("%m-%d %H:%M")
+    except ValueError:
+        return iso
 
 
 # --------------------------------------------------------------------------- #
@@ -411,6 +489,7 @@ class OfficialBroadcastPlugin(Star):
         self._flush_task: asyncio.Task | None = None
         self._scheduler: Any = None
         self._schedule_error = ""
+        self._task_errors: dict[str, str] = {}
 
         self._load_settings()
         self._load_registry()
@@ -422,7 +501,7 @@ class OfficialBroadcastPlugin(Star):
             ok, message = self._reschedule()
             if ok:
                 logger.info(f"[broadcast] {message}")
-            elif self._settings.enable_schedule:
+            elif self._settings.schedules:
                 logger.warning(f"[broadcast] 定时任务未生效：{message}")
         except Exception:
             logger.exception("[broadcast] 初始化定时任务失败")
@@ -485,6 +564,15 @@ class OfficialBroadcastPlugin(Star):
 
         try:
             raw = json.loads(self._settings_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and (
+                "schedule" in raw
+                or "enable_schedule" in raw
+                or "schedule_message" in raw
+            ):
+                logger.warning(
+                    "[broadcast] settings.json 仍是 2.1 及更早版本的单任务结构，"
+                    "定时设置未加载；请到配置页重新添加定时任务"
+                )
             self._settings = Settings.from_dict(raw)
         except SettingsError as exc:
             logger.error(f"[broadcast] 配置校验失败，回退默认值：{exc}")
@@ -954,16 +1042,39 @@ class OfficialBroadcastPlugin(Star):
         except Exception:
             logger.debug("[broadcast] 关闭调度器时出错", exc_info=True)
 
+    def _build_trigger(self, task: ScheduleTask) -> Any:
+        """把任务编译成 APScheduler 触发器。"""
+        tz = self._tz()
+        hour, minute = (int(part) for part in task.time.split(":"))
+        if task.mode == "once":
+            run_at = task.run_at(tz)
+            if run_at is None:
+                raise SettingsError("仅一次任务缺少日期")
+            if run_at <= datetime.now(tz):
+                raise SettingsError("计划时间已过，请重新选择日期")
+            return DateTrigger(run_date=run_at)
+        if task.mode == "weekly":
+            days = sorted({d for d in task.weekdays if 0 <= d <= 6})
+            if not days:
+                raise SettingsError("每周模式至少要选择一天")
+            day_of_week = ",".join(WEEKDAY_CRON[d] for d in days)
+            return CronTrigger(
+                day_of_week=day_of_week, hour=hour, minute=minute, timezone=tz
+            )
+        return CronTrigger(hour=hour, minute=minute, timezone=tz)
+
     def _reschedule(self) -> tuple[bool, str]:
-        """清掉旧任务并按最新配置重新注册。"""
+        """清掉旧任务，按最新配置为每个任务注册独立 job。"""
         self._shutdown_scheduler()
         self._schedule_error = ""
+        self._task_errors = {}
+        tasks = self._settings.schedules
+        enabled = [task for task in tasks if task.enabled]
 
-        if not self._settings.enable_schedule:
-            return False, "定时广播未开启"
-        if not self._settings.schedule_message.strip():
-            self._schedule_error = "定时消息为空，到点不会发送"
-            return False, self._schedule_error
+        if not tasks:
+            return False, "尚未添加定时任务"
+        if not enabled:
+            return False, "所有定时任务都已停用"
         if not self._config_enabled():
             self._schedule_error = "插件总开关已关闭"
             return False, self._schedule_error
@@ -971,53 +1082,140 @@ class OfficialBroadcastPlugin(Star):
             self._schedule_error = "未安装 apscheduler，无法注册定时任务"
             return False, self._schedule_error
 
-        try:
-            cron = self._settings.schedule.to_cron()
-        except SettingsError as exc:
-            self._schedule_error = str(exc)
+        scheduler = AsyncIOScheduler(timezone=self._tz())
+        registered = 0
+        for task in enabled:
+            try:
+                trigger = self._build_trigger(task)
+            except SettingsError as exc:
+                self._task_errors[task.id] = str(exc)
+                continue
+            except Exception as exc:  # pragma: no cover - 触发器异常
+                self._task_errors[task.id] = f"时间规则无效：{exc}"
+                continue
+            try:
+                scheduler.add_job(
+                    self._run_scheduled_task,
+                    trigger,
+                    args=[task.id],
+                    id=task.job_id,
+                    replace_existing=True,
+                    coalesce=True,
+                    max_instances=1,
+                    misfire_grace_time=600,
+                )
+                registered += 1
+            except Exception as exc:  # pragma: no cover - 注册异常
+                self._task_errors[task.id] = f"注册失败：{exc}"
+
+        if registered == 0:
+            detail = "；".join(sorted(set(self._task_errors.values())))
+            self._schedule_error = (
+                f"没有可用的定时任务：{detail}" if detail else ("没有可用的定时任务")
+            )
             return False, self._schedule_error
 
         try:
-            trigger = CronTrigger.from_crontab(cron, timezone=self._tz())
-            scheduler = AsyncIOScheduler(timezone=self._tz())
-            scheduler.add_job(
-                self._run_scheduled,
-                trigger,
-                id=SCHEDULE_JOB_ID,
-                replace_existing=True,
-                coalesce=True,
-                max_instances=1,
-                misfire_grace_time=600,
-            )
             scheduler.start()
         except Exception as exc:
-            self._schedule_error = f"注册定时任务失败：{exc}"
-            logger.exception("[broadcast] 注册定时任务失败")
+            self._schedule_error = f"启动调度器失败：{exc}"
+            logger.exception("[broadcast] 启动调度器失败")
             return False, self._schedule_error
 
         self._scheduler = scheduler
-        return True, f"定时广播已生效（{self._settings.schedule.describe()}）"
+        failed = len(enabled) - registered
+        message = f"已注册 {registered} 个定时任务"
+        if failed:
+            message += f"，{failed} 个未生效"
+        return True, message
 
-    async def _run_scheduled(self) -> None:
-        message = self._settings.schedule_message.strip()
-        if not message:
-            logger.warning("[broadcast] 定时任务触发，但消息为空，已跳过")
+    async def _run_scheduled_task(self, task_id: str) -> None:
+        task = next((t for t in self._settings.schedules if t.id == task_id), None)
+        if task is None or not task.enabled:
             return
+
+        if not task.message.strip():
+            self._task_errors[task_id] = "消息内容为空，未发送"
+            logger.warning(f"[broadcast] 定时任务 {task_id} 消息为空，已跳过")
+            self._finish_once_task(task, fired=False)
+            return
+
         if self._busy:
-            logger.warning("[broadcast] 上一次广播仍在执行，本次定时任务跳过")
+            logger.warning(f"[broadcast] 上一次广播未结束，任务 {task_id} 稍后重试")
+            if task.mode == "once":
+                self._retry_once_later(task)
             return
-        logger.info("[broadcast] 定时广播开始")
-        await self.do_broadcast(message, source="schedule")
 
-    def _next_run_at(self) -> str:
+        logger.info(f"[broadcast] 定时任务 {task_id} 开始（{task.describe()}）")
+        try:
+            await self.do_broadcast(task.message.strip(), source="schedule")
+            self._task_errors.pop(task_id, None)
+        finally:
+            self._finish_once_task(task, fired=True)
+
+    def _finish_once_task(self, task: ScheduleTask, *, fired: bool) -> None:
+        """一次性任务跑完后自动停用，像闹钟响过就不再响。"""
+        if task.mode != "once":
+            return
+        task.enabled = False
+        if fired:
+            task.last_fired = datetime.now(self._tz()).isoformat(timespec="seconds")
+        try:
+            self._save_settings()
+        except Exception:
+            logger.exception("[broadcast] 停用一次性任务失败")
+
+    def _retry_once_later(self, task: ScheduleTask, delay: int = 300) -> None:
+        """一次性任务撞上正在进行的广播时，延迟重试而不是直接丢掉。"""
+        if self._scheduler is None:
+            return
+        try:
+            self._scheduler.add_job(
+                self._run_scheduled_task,
+                DateTrigger(
+                    run_date=datetime.now(self._tz()) + timedelta(seconds=delay)
+                ),
+                args=[task.id],
+                id=f"{task.job_id}_retry{int(time.time())}",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            logger.info(f"[broadcast] 任务 {task.id} 将在 {delay} 秒后重试")
+        except Exception:
+            logger.exception("[broadcast] 安排重试失败")
+
+    def _task_next_run(self, task_id: str) -> str:
         if self._scheduler is None:
             return ""
         try:
-            job = self._scheduler.get_job(SCHEDULE_JOB_ID)
+            job = self._scheduler.get_job(f"{JOB_PREFIX}{task_id}")
             next_run = getattr(job, "next_run_time", None) if job else None
             return next_run.isoformat() if next_run else ""
         except Exception:
             return ""
+
+    def _schedule_runtime(self) -> list[dict[str, Any]]:
+        """每条任务的运行态：下次触发时间与错误原因。"""
+        runtime: list[dict[str, Any]] = []
+        for task in self._settings.schedules:
+            runtime.append(
+                {
+                    "id": task.id,
+                    "next_run_at": self._task_next_run(task.id),
+                    "error": self._task_errors.get(task.id, ""),
+                }
+            )
+        return runtime
+
+    def _next_run_at(self) -> str:
+        """所有任务中最早的一次触发时间。"""
+        stamps = [
+            item["next_run_at"]
+            for item in self._schedule_runtime()
+            if item.get("next_run_at")
+        ]
+        return min(stamps) if stamps else ""
 
     # ------------------------------------------------------------------ #
     # Web API
@@ -1069,9 +1267,7 @@ class OfficialBroadcastPlugin(Star):
             "schedule_active": self._scheduler is not None,
             "schedule_error": self._schedule_error,
             "next_run_at": self._next_run_at(),
-            "cron": self._settings.schedule.to_cron()
-            if self._settings.enable_schedule
-            else "",
+            "schedules": self._schedule_runtime(),
             "last_result": self._state.get("last_result"),
             "scheduler_available": SCHEDULER_AVAILABLE,
             "aiocqhttp": [pid for pid, _ in self._aiocqhttp_instances()],
@@ -1132,11 +1328,11 @@ class OfficialBroadcastPlugin(Star):
             self._set_enabled(bool(payload.get("enabled")))
 
         ok, message = self._reschedule()
-        if not ok and settings.enable_schedule:
+        if not ok and settings.schedules:
             logger.warning(f"[broadcast] 定时任务未生效：{message}")
 
         data = await self._api_payload()
-        data["schedule_message"] = message
+        data["schedule_note"] = message
         data["schedule_ok"] = ok
         return json_response(data)
 
@@ -1268,13 +1464,27 @@ class OfficialBroadcastPlugin(Star):
             + (
                 f" / {settings.daily_limit}" if settings.daily_limit > 0 else "（不限）"
             ),
-            f"定时广播：{'开启' if settings.enable_schedule else '关闭'}",
         ]
-        if settings.enable_schedule:
-            lines.append(f"计划：{settings.schedule.describe()}")
-            lines.append(f"下次触发：{overview['next_run_at'] or '未注册'}")
-            if overview["schedule_error"]:
-                lines.append(f"⚠️ {overview['schedule_error']}")
+
+        tasks = settings.schedules
+        active = sum(1 for task in tasks if task.enabled)
+        lines.append(f"定时任务：{len(tasks)} 个（启用 {active} 个）")
+        runtime = {item["id"]: item for item in overview["schedules"]}
+        for task in tasks[:5]:
+            state = runtime.get(task.id) or {}
+            if state.get("error"):
+                detail = f"⚠️ {state['error']}"
+            elif state.get("next_run_at"):
+                detail = f"下次 {_short_time(state['next_run_at'])}"
+            elif task.last_fired:
+                detail = f"已于 {_short_time(task.last_fired)} 执行"
+            else:
+                detail = "未注册"
+            lines.append(f"{'✅' if task.enabled else '⏸'} {task.describe()}｜{detail}")
+        if len(tasks) > 5:
+            lines.append(f"…… 其余 {len(tasks) - 5} 条请到插件配置页查看")
+        if overview["schedule_error"]:
+            lines.append(f"⚠️ {overview['schedule_error']}")
         if missing:
             lines.append(f"⚠️ 白名单中 {len(missing)} 个 UMO 当前未发现")
         yield event.plain_result("\n".join(lines))

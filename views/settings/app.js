@@ -16,6 +16,7 @@ const PLUGIN_ENDPOINT = {
 };
 
 const WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+const MAX_SCHEDULES = 20;
 const MAX_RENDER_ROWS = 400;
 
 const state = {
@@ -26,8 +27,8 @@ const state = {
   messageTypes: [],
   overview: {},
   filters: { q: "", platform: "", type: "", status: "all" },
-  scheduleMode: "daily",
-  weekdays: [0, 1, 2, 3, 4, 5, 6],
+  schedules: [],
+  runtime: {},
   saving: false,
 };
 
@@ -92,21 +93,52 @@ function messageTypeLabel(type) {
   return type || "未知";
 }
 
-function scheduleText(mode, time, weekdays) {
-  if (mode === "weekly") {
-    const days = [...weekdays].sort((a, b) => a - b).map((d) => WEEKDAY_LABELS[d]);
-    return `每周 ${days.join("、") || "（未选择）"} ${time}`;
+function describeTask(task) {
+  const time = task.time || "09:00";
+  if (task.mode === "weekly") {
+    const days = [...(task.weekdays || [])].sort((a, b) => a - b);
+    if (!days.length) return `每周 ${time}（未选星期）`;
+    return `每周 ${days.map((d) => WEEKDAY_LABELS[d]).join("、")} ${time}`;
+  }
+  if (task.mode === "once") {
+    return `${task.date || "未选日期"} ${time} 仅一次`;
   }
   return `每天 ${time}`;
 }
 
-function cronText(mode, time, weekdays) {
-  const [hour, minute] = String(time || "09:00").split(":");
-  const dow =
-    mode === "weekly"
-      ? [...weekdays].sort((a, b) => a - b).join(",") || "*"
-      : "*";
-  return `${Number(minute)} ${Number(hour)} * * ${dow}`;
+function pad(n) {
+  return String(n).padStart(2, "0");
+}
+
+function dateStr(date) {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** 默认时间：下一个整点，避免新建任务时填一个已经过去的时间。 */
+function defaultTime() {
+  const now = new Date();
+  now.setMinutes(0, 0, 0);
+  now.setHours(now.getHours() + 1);
+  if (now.getDate() !== new Date().getDate()) return "09:00";
+  return `${pad(now.getHours())}:00`;
+}
+
+/** 仅一次任务默认日期：今天还没到时间就今天，否则明天（和设闹钟一致）。 */
+function defaultDate(time) {
+  const now = new Date();
+  const [hour, minute] = String(time || "09:00").split(":").map(Number);
+  const target = new Date(now);
+  target.setHours(hour, minute, 0, 0);
+  if (target.getTime() <= now.getTime()) {
+    target.setDate(target.getDate() + 1);
+  }
+  return dateStr(target);
+}
+
+function newId() {
+  const bytes = new Uint8Array(3);
+  crypto.getRandomValues(bytes);
+  return "t" + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function makeIcon(kind) {
@@ -120,10 +152,18 @@ function makeIcon(kind) {
   svg.setAttribute("stroke-width", "2");
   svg.setAttribute("stroke-linecap", "round");
   svg.setAttribute("stroke-linejoin", "round");
-  const paths =
-    kind === "restore"
-      ? ["M9 14 4 9l5-5", "M4 9h11a5 5 0 0 1 0 10h-3"]
-      : ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18", "M5.6 5.6l12.8 12.8"];
+  const ICONS = {
+    ban: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18", "M5.6 5.6l12.8 12.8"],
+    restore: ["M9 14 4 9l5-5", "M4 9h11a5 5 0 0 1 0 10h-3"],
+    trash: [
+      "M4 7h16",
+      "M6.5 7l.9 11.2A2 2 0 0 0 9.4 20h5.2a2 2 0 0 0 2-1.8L17.5 7",
+      "M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7",
+      "M10.5 11v5",
+      "M13.5 11v5",
+    ],
+  };
+  const paths = ICONS[kind] || ICONS.ban;
   paths.forEach((d) => {
     const path = document.createElementNS(NS, "path");
     path.setAttribute("d", d);
@@ -163,9 +203,13 @@ function renderOverview() {
     settings.daily_limit > 0
       ? `${overview.today_sent ?? 0}<small> / ${settings.daily_limit}</small>`
       : `${overview.today_sent ?? 0}<small> / 不限</small>`;
-  $("stat-next").textContent = overview.schedule_active
+
+  const activeTasks = (state.schedules || []).filter((task) => task.enabled).length;
+  $("stat-next").textContent = overview.next_run_at
     ? formatDateTime(overview.next_run_at)
-    : "未开启";
+    : activeTasks
+      ? "待保存"
+      : "未开启";
 
   const banner = $("runtime-banner");
   const problems = [];
@@ -178,11 +222,11 @@ function renderOverview() {
   if (problems.length) {
     banner.className = "banner warn";
     banner.textContent = problems.join("；");
-  } else if (overview.schedule_active) {
+  } else if (activeTasks) {
     banner.className = "banner ok";
-    banner.textContent = `定时广播已生效：${settings.schedule?.mode === "weekly" ? "每周" : "每天"} ${
-      settings.schedule?.time || ""
-    }，下次触发 ${formatDateTime(overview.next_run_at)}`;
+    banner.textContent =
+      `定时广播已生效：${activeTasks} 个任务` +
+      (overview.next_run_at ? `，最近一次 ${formatDateTime(overview.next_run_at)}` : "");
   } else {
     banner.className = "banner hidden";
     banner.textContent = "";
@@ -205,60 +249,248 @@ function renderModeBanner() {
   }
 }
 
-function renderWeekdays() {
-  const box = $("weekdays");
-  box.innerHTML = "";
-  WEEKDAY_LABELS.forEach((label, index) => {
+function todayWeekday() {
+  return (new Date().getDay() + 6) % 7;
+}
+
+function field(labelText) {
+  const wrap = document.createElement("div");
+  wrap.className = "field";
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  wrap.appendChild(label);
+  return wrap;
+}
+
+function buildTaskCard(task) {
+  const card = document.createElement("div");
+  card.className = "task";
+  card.dataset.id = task.id;
+
+  /* 标题行 */
+  const head = document.createElement("div");
+  head.className = "task-head";
+
+  const title = document.createElement("div");
+  title.className = "task-title";
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  const titleText = document.createElement("span");
+  title.append(dot, titleText);
+
+  const actions = document.createElement("div");
+  actions.className = "task-actions";
+
+  const toggleLabel = document.createElement("label");
+  toggleLabel.className = "switch";
+  toggleLabel.title = "启用或停用该任务";
+  const toggle = document.createElement("input");
+  toggle.type = "checkbox";
+  toggle.checked = task.enabled !== false;
+  const toggleText = document.createElement("span");
+  toggleLabel.append(toggle, toggleText);
+
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.className = "icon-btn";
+  delBtn.title = "删除该任务";
+  delBtn.appendChild(makeIcon("trash"));
+
+  actions.append(toggleLabel, delBtn);
+  head.append(title, actions);
+
+  const meta = document.createElement("div");
+  meta.className = "task-meta";
+
+  /* 表单 */
+  const grid = document.createElement("div");
+  grid.className = "grid";
+
+  const modeField = field("重复方式");
+  const seg = document.createElement("div");
+  seg.className = "seg";
+  const modeButtons = [
+    ["daily", "每天"],
+    ["weekly", "每周"],
+    ["once", "仅一次"],
+  ].map(([mode, label]) => {
     const btn = document.createElement("button");
     btn.type = "button";
+    btn.dataset.mode = mode;
     btn.textContent = label;
+    seg.appendChild(btn);
+    return btn;
+  });
+  modeField.appendChild(seg);
+
+  const timeField = field("发送时间");
+  const timeInput = document.createElement("input");
+  timeInput.type = "time";
+  timeInput.step = "60";
+  timeInput.value = task.time || "09:00";
+  timeField.appendChild(timeInput);
+
+  const dateField = field("执行日期");
+  const dateInput = document.createElement("input");
+  dateInput.type = "date";
+  dateInput.value = task.date || "";
+  const dateHint = document.createElement("span");
+  dateHint.className = "hint";
+  dateHint.textContent = "到点执行一次后自动停用，像闹钟一样。";
+  dateField.append(dateInput, dateHint);
+
+  grid.append(modeField, timeField, dateField);
+
+  const weekField = field("选择星期");
+  const weekBox = document.createElement("div");
+  weekBox.className = "weekdays";
+  const weekButtons = WEEKDAY_LABELS.map((label, index) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
     btn.dataset.day = String(index);
-    if (state.weekdays.includes(index)) btn.classList.add("active");
-    btn.addEventListener("click", () => {
-      const set = new Set(state.weekdays);
-      if (set.has(index)) set.delete(index);
-      else set.add(index);
-      state.weekdays = [...set].sort((a, b) => a - b);
-      renderWeekdays();
-      renderSchedulePreview();
+    btn.textContent = label;
+    weekBox.appendChild(btn);
+    return btn;
+  });
+  weekField.appendChild(weekBox);
+
+  const msgField = field("消息内容");
+  const textarea = document.createElement("textarea");
+  textarea.maxLength = 4000;
+  textarea.placeholder = "例如：早安，今天的例行维护安排在 20:00，请提前保存工作。";
+  textarea.value = task.message || "";
+  msgField.appendChild(textarea);
+
+  card.append(head, meta, grid, weekField, msgField);
+
+  /* 渲染同步 */
+  function refreshMeta() {
+    const runtime = state.runtime[task.id] || {};
+    let text = "";
+    let warn = false;
+    if (runtime.error) {
+      text = runtime.error;
+      warn = true;
+    } else if (task.enabled === false) {
+      text = task.last_fired
+        ? `已于 ${formatDateTime(task.last_fired)} 执行完成`
+        : "已停用，保存后不会触发";
+    } else if (runtime.next_run_at) {
+      text = `下次触发 ${formatDateTime(runtime.next_run_at)}`;
+    } else {
+      text = "保存后生效";
+    }
+    meta.textContent = text;
+    meta.classList.toggle("warn", warn);
+  }
+
+  function refresh() {
+    titleText.textContent = describeTask(task);
+    card.classList.toggle("off", task.enabled === false);
+    toggle.checked = task.enabled !== false;
+    toggleText.textContent = task.enabled === false ? "停用" : "启用";
+    dateField.classList.toggle("hidden", task.mode !== "once");
+    weekField.classList.toggle("hidden", task.mode !== "weekly");
+    modeButtons.forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.mode === task.mode);
     });
-    box.appendChild(btn);
+    weekButtons.forEach((btn) => {
+      btn.classList.toggle("active", (task.weekdays || []).includes(Number(btn.dataset.day)));
+    });
+    if (timeInput.value !== task.time) timeInput.value = task.time;
+    if (dateInput.value !== (task.date || "")) dateInput.value = task.date || "";
+    refreshMeta();
+    updateSaveSummary();
+  }
+
+  modeButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      task.mode = btn.dataset.mode;
+      if (task.mode === "weekly" && !(task.weekdays || []).length) {
+        task.weekdays = [todayWeekday()];
+      }
+      if (task.mode === "once" && !task.date) {
+        task.date = defaultDate(task.time);
+      }
+      refresh();
+    });
   });
+
+  weekButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const day = Number(btn.dataset.day);
+      const days = new Set(task.weekdays || []);
+      if (days.has(day)) days.delete(day);
+      else days.add(day);
+      task.weekdays = [...days].sort((a, b) => a - b);
+      refresh();
+    });
+  });
+
+  timeInput.addEventListener("change", () => {
+    task.time = timeInput.value || "09:00";
+    if (task.mode === "once" && !task.date) task.date = defaultDate(task.time);
+    refresh();
+  });
+
+  dateInput.addEventListener("change", () => {
+    task.date = dateInput.value || "";
+    refresh();
+  });
+
+  textarea.addEventListener("input", () => {
+    task.message = textarea.value;
+    updateSaveSummary();
+  });
+
+  toggle.addEventListener("change", () => {
+    task.enabled = toggle.checked;
+    refresh();
+  });
+
+  delBtn.addEventListener("click", () => {
+    const index = state.schedules.indexOf(task);
+    if (index >= 0) state.schedules.splice(index, 1);
+    renderSchedules();
+    toast("已删除该定时任务，保存后生效");
+  });
+
+  refresh();
+  return card;
 }
 
-function renderSchedule() {
-  const settings = state.settings || {};
-  $("enable-schedule").checked = Boolean(settings.enable_schedule);
-  $("enable-schedule-label").textContent = settings.enable_schedule ? "开启" : "关闭";
-
-  const schedule = settings.schedule || {};
-  state.scheduleMode = schedule.mode === "weekly" ? "weekly" : "daily";
-  state.weekdays =
-    Array.isArray(schedule.weekdays) && schedule.weekdays.length
-      ? schedule.weekdays
-      : [0, 1, 2, 3, 4, 5, 6];
-
-  document.querySelectorAll("#schedule-mode button").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.mode === state.scheduleMode);
-  });
-  $("weekday-field").classList.toggle("hidden", state.scheduleMode !== "weekly");
-  $("schedule-time").value = schedule.time || "09:00";
-  $("schedule-message").value = settings.schedule_message || "";
-  renderWeekdays();
-  renderSchedulePreview();
+function renderSchedules() {
+  const list = $("schedule-list");
+  list.innerHTML = "";
+  state.schedules.forEach((task) => list.appendChild(buildTaskCard(task)));
+  $("schedule-empty").classList.toggle("hidden", state.schedules.length > 0);
+  $("add-schedule").disabled = state.schedules.length >= MAX_SCHEDULES;
+  updateSaveSummary();
 }
 
-function renderSchedulePreview() {
-  const mode = state.scheduleMode;
-  const time = $("schedule-time").value || "09:00";
-  const enabled = $("enable-schedule").checked;
-  const length = $("schedule-message").value.length;
-  const head = enabled ? scheduleText(mode, time, state.weekdays) : "定时广播未启用";
-  $("schedule-preview").textContent = `${head}　·　Cron ${cronText(
-    mode,
+function addSchedule() {
+  if (state.schedules.length >= MAX_SCHEDULES) {
+    toast(`最多只能添加 ${MAX_SCHEDULES} 个定时任务`, true);
+    return;
+  }
+  const time = defaultTime();
+  const task = {
+    id: newId(),
+    message: "",
+    enabled: true,
+    mode: "daily",
     time,
-    state.weekdays
-  )}　·　正文 ${length} 字`;
+    weekdays: [todayWeekday()],
+    date: "",
+    last_fired: "",
+  };
+  state.schedules.push(task);
+  renderSchedules();
+  const textarea = document.querySelector(`.task[data-id="${task.id}"] textarea`);
+  if (textarea) {
+    textarea.focus();
+    textarea.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
 }
 
 function fillSelect(select, values, current, labeler, placeholder) {
@@ -436,7 +668,7 @@ function renderAll() {
   $("auto-register-label").textContent = settings.auto_register === false ? "关闭" : "开启";
 
   renderFilters();
-  renderSchedule();
+  renderSchedules();
   renderSessions();
   renderLastResult();
 }
@@ -445,9 +677,8 @@ function updateSaveSummary() {
   const settings = state.settings || {};
   const targets = targetSet();
   const mode = targets.size ? `仅发 ${targets.size} 个会话` : "全部会话";
-  const schedule = settings.enable_schedule
-    ? scheduleText(settings.schedule?.mode, settings.schedule?.time, state.weekdays)
-    : "定时未开启";
+  const active = (state.schedules || []).filter((task) => task.enabled).length;
+  const schedule = active ? `${active} 个定时任务` : "定时未开启";
   $("save-summary").textContent = `${mode}　·　${schedule}　·　间隔 ${settings.send_interval}s`;
 }
 
@@ -518,13 +749,16 @@ function collectForm() {
     send_interval: Number($("send-interval").value || 0),
     max_per_minute: Number($("max-per-minute").value || 0),
     daily_limit: Number($("daily-limit").value || 0),
-    enable_schedule: $("enable-schedule").checked,
-    schedule: {
-      mode: state.scheduleMode,
-      time: $("schedule-time").value || "09:00",
-      weekdays: [...state.weekdays].sort((a, b) => a - b),
-    },
-    schedule_message: $("schedule-message").value || "",
+    schedules: state.schedules.map((task) => ({
+      id: task.id,
+      message: task.message || "",
+      enabled: task.enabled !== false,
+      mode: task.mode,
+      time: task.time || "09:00",
+      weekdays: [...(task.weekdays || [])].sort((a, b) => a - b),
+      date: task.mode === "once" ? task.date || "" : "",
+      last_fired: task.last_fired || "",
+    })),
     timezone: $("timezone").value.trim() || "Asia/Shanghai",
     auto_register: $("auto-register").checked,
   };
@@ -532,18 +766,23 @@ function collectForm() {
 
 async function save() {
   if (state.saving) return;
+  const empty = state.schedules.filter(
+    (task) => task.enabled !== false && !String(task.message || "").trim()
+  ).length;
   state.saving = true;
   const button = $("save");
   button.disabled = true;
   button.textContent = "保存中…";
   try {
     const payload = collectForm();
-    if (payload.enable_schedule && !payload.schedule_message.trim()) {
-      toast("已开启定时广播，但消息内容为空，到点不会发送", true);
-    }
     const data = await api.post(PLUGIN_ENDPOINT.save, payload);
     applyPayload(data);
-    toast(data.schedule_ok ? "已保存，定时任务已生效" : `已保存：${data.schedule_message}`);
+    let note = "";
+    if (!payload.schedules.length) note = "已保存";
+    else if (data.schedule_ok) note = `已保存，${data.schedule_note}`;
+    else note = `已保存：${data.schedule_note}`;
+    if (empty) note += `（${empty} 个任务消息为空，到点不会发送）`;
+    toast(note);
   } catch (error) {
     toast(`保存失败：${error.message || error}`, true);
   } finally {
@@ -588,12 +827,17 @@ function applyPayload(data) {
   state.platforms = data.platforms || [];
   state.messageTypes = data.message_types || [];
   state.overview = data.overview || {};
+  state.schedules = (state.settings?.schedules || []).map((task) => ({ ...task }));
+  state.runtime = Object.fromEntries(
+    (state.overview?.schedules || []).map((item) => [item.id, item])
+  );
   renderAll();
 }
 
 function bindEvents() {
   $("save").addEventListener("click", save);
   $("refresh-sessions").addEventListener("click", refreshSessions);
+  $("add-schedule").addEventListener("click", addSchedule);
 
   $("enabled").addEventListener("change", () => {
     $("enabled-label").textContent = $("enabled").checked ? "已启用" : "已禁用";
@@ -601,24 +845,6 @@ function bindEvents() {
   $("auto-register").addEventListener("change", () => {
     $("auto-register-label").textContent = $("auto-register").checked ? "开启" : "关闭";
   });
-  $("enable-schedule").addEventListener("change", () => {
-    $("enable-schedule-label").textContent = $("enable-schedule").checked ? "开启" : "关闭";
-    renderSchedulePreview();
-  });
-
-  document.querySelectorAll("#schedule-mode button").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      state.scheduleMode = btn.dataset.mode;
-      document.querySelectorAll("#schedule-mode button").forEach((item) => {
-        item.classList.toggle("active", item === btn);
-      });
-      $("weekday-field").classList.toggle("hidden", state.scheduleMode !== "weekly");
-      renderSchedulePreview();
-    });
-  });
-
-  $("schedule-time").addEventListener("change", renderSchedulePreview);
-  $("schedule-message").addEventListener("input", renderSchedulePreview);
 
   $("search").addEventListener("input", () => {
     state.filters.q = $("search").value;

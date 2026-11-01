@@ -284,6 +284,112 @@
         font-weight: 600;
       }
 
+      .card-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .card-head .desc {
+        margin-bottom: 0;
+        max-width: 640px;
+      }
+
+      .schedule-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        margin-top: 14px;
+      }
+
+      .task {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px;
+        background: var(--bg);
+      }
+
+      .task.off .task-title {
+        color: var(--muted);
+      }
+
+      .task.off .task-title .dot {
+        background: var(--border-strong);
+      }
+
+      .task-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 2px;
+      }
+
+      .task-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13.5px;
+        font-weight: 650;
+        min-width: 0;
+      }
+
+      .task-title span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .task-title .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--ok);
+        flex: none;
+      }
+
+      .task-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex: none;
+      }
+
+      .task-meta {
+        color: var(--muted);
+        font-size: 12px;
+        margin: 0 0 12px 15px;
+      }
+
+      .task-meta.warn {
+        color: var(--warn);
+      }
+
+      .task .grid {
+        grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+        gap: 12px 14px;
+        margin-bottom: 14px;
+      }
+
+      .task > .field + .field {
+        margin-top: 12px;
+      }
+
+      .task .field > label {
+        font-size: 12px;
+      }
+
+      .task .seg button {
+        padding: 6px 13px;
+        font-size: 13px;
+      }
+
+      .task textarea {
+        min-height: 70px;
+      }
+
       .toolbar {
         display: flex;
         flex-wrap: wrap;
@@ -603,6 +709,23 @@
         .card {
           padding: 14px;
         }
+        .card-head {
+          flex-direction: column;
+          align-items: stretch;
+        }
+        .card-head .btn {
+          align-self: stretch;
+          text-align: center;
+        }
+      }
+
+      @media (max-width: 480px) {
+        .task-actions .switch span {
+          display: none;
+        }
+        .task-title {
+          font-size: 13px;
+        }
       }
     </style>
   </head>
@@ -688,40 +811,19 @@
         </section>
 
         <section class="card">
-          <h2>定时广播</h2>
-          <p class="desc">可视化选择时间，保存后立即重建定时任务，无需重启 AstrBot。</p>
-          <div class="grid">
-            <div class="field">
-              <label>启用定时广播</label>
-              <label class="switch">
-                <input type="checkbox" id="enable-schedule" />
-                <span id="enable-schedule-label">关闭</span>
-              </label>
+          <div class="card-head">
+            <div>
+              <h2>定时广播</h2>
+              <p class="desc">
+                每个任务独立设置时间与内容，可选每天、每周或仅执行一次。保存后立即重建调度，无需重启
+                AstrBot。
+              </p>
             </div>
-            <div class="field">
-              <label>重复方式</label>
-              <div class="seg" id="schedule-mode">
-                <button type="button" data-mode="daily">每天</button>
-                <button type="button" data-mode="weekly">每周</button>
-              </div>
-            </div>
-            <div class="field">
-              <label for="schedule-time">发送时间</label>
-              <input type="time" id="schedule-time" step="60" />
-            </div>
+            <button type="button" class="btn" id="add-schedule">新建任务</button>
           </div>
-          <div class="field hidden" id="weekday-field" style="margin-top: 14px">
-            <label>选择星期</label>
-            <div class="weekdays" id="weekdays"></div>
-          </div>
-          <div class="field" style="margin-top: 14px">
-            <label for="schedule-message">定时消息内容</label>
-            <textarea
-              id="schedule-message"
-              maxlength="4000"
-              placeholder="例如：早安，今天的例行维护安排在 20:00，请提前保存工作。"
-            ></textarea>
-            <span class="hint" id="schedule-preview">—</span>
+          <div class="schedule-list" id="schedule-list"></div>
+          <div class="empty hidden" id="schedule-empty">
+            还没有定时任务。点「新建任务」添加，最多 20 个。
           </div>
         </section>
 
