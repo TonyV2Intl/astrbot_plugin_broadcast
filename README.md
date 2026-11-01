@@ -47,7 +47,8 @@ astrbot_plugin_broadcast/
 
 **基础设置**
 
-- 管理员 UID（逗号分隔，留空回退到 AstrBot 全局管理员；也可在群里用 `/broadcast_auth <UID>` 直接授权）
+- 管理员 UID（逗号分隔；也可在群里用 `/broadcast_auth <UID>` 直接授权）
+- **AstrBot 超级管理员始终拥有广播与授权权限**，不受上面的 UID 列表限制；列表只用于额外放行普通用户
 - 每个会话发送间隔（默认 2 秒）
 - 每分钟最多发送条数（0 = 不限，QQ 官方建议 20）
 - 每日额度上限（0 = 不限，QQ 官方主动消息约 1000 条/天）
@@ -109,6 +110,8 @@ AstrBot 开启「对话隔离」（配置项 `platform_settings.unique_session`�
 ### 用 `/broadcast_auth` 授权管理员
 
 在群里直接填 UID 就能加人，不用回后台手填。只有**当前已在 `admin_uids` 里的人**或 **AstrBot 超级管理员**能执行；成功后立即写回 `settings.json`，配置页刷新即可看到。
+
+> 超级管理员是「始终保留」的，不会被 `admin_uids` 顶掉——所以往列表里写第一个 UID 时不用担心把自己锁在外面。
 
 ```text
 /broadcast_auth 123456789

@@ -1572,7 +1572,7 @@ class OfficialBroadcastPlugin(Star):
         QQ 官方等平台不会把「被 @ 的用户」下发给机器人（只有 @ 机器人
         自己才会进入消息链），因此这里改为直接接收 UID 文本。
         """
-        if not self._can_grant_admin(event):
+        if not self._is_admin(event):
             yield event.plain_result(
                 "⚠️ 权限不足：仅广播管理员或 AstrBot 超级管理员可用。"
             )
@@ -1631,14 +1631,15 @@ class OfficialBroadcastPlugin(Star):
             return ""
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """广播管理员：名单内成员，或 AstrBot 超级管理员（始终保留权限）。
+
+        即使 ``admin_uids`` 非空，AstrBot 全局管理员也不会被排除，
+        避免写进第一个 UID 后把自己的管理入口锁死。
+        """
+        if self._is_super_admin(event):
+            return True
         uid = self._sender_id(event)
-        admins = self._settings.admin_uids
-        if admins:
-            return bool(uid) and uid in admins
-        try:
-            return bool(event.is_admin())
-        except Exception:
-            return False
+        return bool(uid) and uid in self._settings.admin_uids
 
     def _is_super_admin(self, event: AstrMessageEvent) -> bool:
         """AstrBot 全局管理员（事件 role == admin）。"""
@@ -1646,10 +1647,6 @@ class OfficialBroadcastPlugin(Star):
             return bool(event.is_admin())
         except Exception:
             return False
-
-    def _can_grant_admin(self, event: AstrMessageEvent) -> bool:
-        """授权指令的门槛：已在广播管理员名单里，或 AstrBot 超级管理员。"""
-        return self._is_admin(event) or self._is_super_admin(event)
 
     @staticmethod
     def _payload(event: AstrMessageEvent) -> str:
