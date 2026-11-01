@@ -105,6 +105,18 @@ _AT_MARKUP_RE = re.compile(
 _AT_TEXT_RE = re.compile(r"[@＠]\S*")
 
 
+def _strip_command(text: str, command: str) -> str:
+    """去掉指令名和它前面的唤醒前缀。
+
+    进入 handler 时 AstrBot 已经剥掉了唤醒前缀（默认 ``/``），
+    ``message_str`` 通常形如 ``"broadcast hello"``；这里同时兼容
+    仍然带前缀的 ``"/broadcast hello"``，避免把指令名当成参数。
+    """
+    raw = str(text or "").lstrip()
+    pattern = rf"^/?\s*{re.escape(command)}(?=\s|$)\s*"
+    return re.sub(pattern, "", raw, count=1, flags=re.IGNORECASE | re.DOTALL)
+
+
 class SettingsError(ValueError):
     """配置校验失败，消息可直接展示给用户。"""
 
@@ -1714,16 +1726,15 @@ class OfficialBroadcastPlugin(Star):
 
     def _has_extra_text(self, event: AstrMessageEvent) -> bool:
         """指令后除 @ 之外是否还有别的文字。"""
-        text = str(getattr(event, "message_str", "") or "")
-        text = re.sub(r"^\s*/\S+\s*", "", text, count=1)
+        text = _strip_command(getattr(event, "message_str", ""), "broadcast_auth")
         text = _AT_MARKUP_RE.sub(" ", text)
         text = _AT_TEXT_RE.sub(" ", text)
         return bool(text.strip())
 
     @staticmethod
     def _payload(event: AstrMessageEvent) -> str:
-        text = str(getattr(event, "message_str", "") or "")
-        return re.sub(r"^\s*/\S+\s*", "", text, count=1, flags=re.DOTALL).strip()
+        text = _strip_command(getattr(event, "message_str", ""), "broadcast")
+        return text.strip()
 
     async def _empty_targets_hint(self) -> str:
         sessions = await self._collect_sessions()
