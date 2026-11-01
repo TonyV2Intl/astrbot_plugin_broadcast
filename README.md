@@ -2,25 +2,43 @@
 
 AstrBot 多会话广播插件。向机器人所在的群聊与私聊批量推送消息，支持独立可视化配置台、定时广播、目标白名单、排除名单、发送限速与每日额度保护。
 
-> **v2 重大变更**：配置不再堆在 AstrBot 的「插件配置」弹窗里，改为插件自带的独立页面（AstrBot Pages）。`_conf_schema.json` 只剩一个总开关。
+> **v2 重大变更**：配置不再堆在 AstrBot 的「插件配置」弹窗里，改为插件自带的可视化视图（`views/settings/`）。`_conf_schema.json` 只剩一个总开关。
 
 ## 环境要求
 
 | 项目 | 要求 |
 | --- | --- |
-| AstrBot | **≥ 4.24.2**（需要 `astrbot.api.web` 与插件 Pages） |
-| Python | ≥ 3.12（跟随 AstrBot 版本要求） |
-| 依赖 | `apscheduler`、`SQLAlchemy`（AstrBot 本体已内置） |
+| AstrBot | **≥ 4.24.2, < 5**（需要 `astrbot.api.web` 与插件视图） |
+| Python | ≥ 3.10（跟随 AstrBot 版本要求） |
+| 依赖 | `apscheduler`、`SQLAlchemy`（AstrBot 本体已内置，`requirements.txt` 仅作显式声明） |
 
-低于 4.24.2 时插件仍能加载、指令仍可用，但**可视化配置页无法打开**，启动日志会给出提示。
+版本低于 4.24.2 时 AstrBot 会按 `metadata.yaml` 的 `astrbot_version` 拒绝加载，而不是加载后页面打不开。
 
 ## 安装
 
 1. 把本目录放到 `data/plugins/astrbot_plugin_broadcast/`；
 2. 在 AstrBot WebUI 的插件页启用插件；
-3. 打开插件详情页 → **广播配置**（页面标题来自 `.astrbot-plugin/i18n/zh-CN.json`）。
+3. 进入插件详情页 → **广播配置**。
 
-新增或删除 `pages/` 下的视图目录后需要重载插件；只改静态文件时刷新页面即可。
+## 目录结构
+
+```
+astrbot_plugin_broadcast/
+├─ main.py                      # 插件入口与后端 Web API
+├─ metadata.yaml                # 插件元数据
+├─ _conf_schema.json            # 仅保留 enabled 总开关
+├─ requirements.txt
+├─ logo.png
+├─ LICENSE
+├─ .astrbot-plugin/
+│  └─ i18n/zh-CN.json           # 插件名、配置项与视图标题的翻译
+└─ views/
+   └─ settings/
+      ├─ index.html             # 视图入口（必须有 index.html）
+      └─ app.js                 # 零依赖前端逻辑
+```
+
+新增或删除 `views/` 下的视图目录后需要**重载插件**；只改静态文件时刷新视图即可。
 
 ## 配置页能做什么
 
@@ -66,7 +84,7 @@ AstrBot 多会话广播插件。向机器人所在的群聊与私聊批量推送
 
 ## 会话是怎么发现的
 
-QQ 官方开放平台**没有**“查询机器人已加入的全部群”的接口（只有单群查询），所以插件用三路合并：
+QQ 官方开放平台**没有**「查询机器人已加入的全部群」的接口（只有单群查询），所以插件用三路合并：
 
 1. **自动登记**：机器人收到任意消息时记录该会话的 UMO（写入 `sessions.json`）；
 2. **适配器缓存**：读取平台实例内存中的 `_session_scene`（QQ 官方适配器用它区分 group / friend）；
@@ -85,24 +103,26 @@ QQ 官方开放平台**没有**“查询机器人已加入的全部群”的接�
 - 每次执行都重新收集会话，不使用启动时的快照；
 - 白名单中的 UMO 即使当前未被发现也会尝试发送（例如刚被数据库清理）；
 - 三层限速：逐条 `send_interval` 延迟 → 每分钟滑动窗口上限 → 每日额度上限；
-- 额度按“发送尝试”计数，用尽后剩余目标记为「跳过」；
+- 额度按「发送尝试」计数，用尽后剩余目标记为「跳过」；
 - 定时任务与手动广播互斥，同一时间只跑一个。
 
 ### QQ 官方的特殊处理
 
 QQ 官方适配器在缺少 `msg_id` 时，只有 `_session_scene` 记录为 `group` 才允许主动群发；该缓存在 AstrBot 重启后为空，会导致消息被**静默丢弃**（`send_by_session` 直接 return，不抛异常）。
 
-插件在每次发送前用持久化的会话表预热该缓存。需要注意：`context.send_message()` 的返回值只表示“是否找到平台实例”，不代表平台真的发出去了，所以 QQ 侧仍可能出现“统计成功但群里没收到”的情况——遇到这种问题先检查机器人在该群的主动消息权限与额度。
+插件在每次发送前用持久化的会话表预热该缓存。需要注意：`context.send_message()` 的返回值只表示「是否找到平台实例」，不代表平台真的发出去了，所以 QQ 侧仍可能出现「统计成功但群里没收到」的情况——遇到这种问题先检查机器人在该群的主动消息权限与额度。
 
 ## Web API
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/astrbot_plugin_broadcast/config/get` | 返回配置、会话列表、平台/场景枚举、运行概览 |
-| POST | `/astrbot_plugin_broadcast/config/save` | 校验并保存配置，重建定时任务，返回最新快照 |
-| POST | `/astrbot_plugin_broadcast/config/refresh` | 重新收集会话（`{"remote": true}` 时含 aiocqhttp 拉取） |
+后端使用 `astrbot.api.web` 的 `request` / `json_response` / `error_response`，不直接暴露 FastAPI、Starlette 或 Quart 的请求对象。
 
-页面通过 `window.AstrBotPluginPage` 的 `apiGet` / `apiPost` 调用，endpoint 不带插件名前缀（如 `config/get`）。
+| 方法 | 路由 | 说明 |
+| --- | --- | --- |
+| GET | `/{plugin}/config/get` | 返回配置、会话列表、平台/场景枚举、运行概览 |
+| POST | `/{plugin}/config/save` | 校验并保存配置，重建定时任务，返回最新快照 |
+| POST | `/{plugin}/config/refresh` | 重新收集会话（`{"remote": true}` 时含 aiocqhttp 拉取） |
+
+视图侧通过 `window.AstrBotPluginView` 的 `apiGet` / `apiPost` 调用，endpoint **不带**插件名前缀、也不以 `/` 开头（如 `config/get`）。出错时后端返回 `error_response`，bridge 会把它 reject 成 `Error`。
 
 ## 数据文件
 
@@ -116,14 +136,13 @@ QQ 官方适配器在缺少 `msg_id` 时，只有 `_session_scene` 记录为 `gr
 
 写入使用临时文件 + `os.replace` 原子替换；文件损坏时自动备份为 `*.broken.<时间戳>` 并回退默认值。
 
-## 从 1.x 升级
-
-首次启动时若 `settings.json` 不存在，插件会读取旧版 `_conf_schema.json` 中的 `admin_uids`、`exclude_umos`、`send_interval`、`schedule_cron`、`schedule_message` 等字段并迁移过去，包括把 `30 7 * * 1,3` 这类 Cron 反解成「每周 周一、周三 07:30」。迁移只发生一次，之后以 `settings.json` 为准。
-
 ## 常见问题
 
 **配置页空白或 404**
-确认 AstrBot ≥ 4.24.2，并重载插件；`pages/settings/` 必须包含 `index.html`。
+确认 AstrBot ≥ 4.24.2 并重载插件；`views/settings/` 必须包含 `index.html`。
+
+**页面提示「没有找到插件视图桥接」**
+说明注入的 `bridge-sdk.js` 没跑到，通常是 AstrBot 版本过低或插件未重载。
 
 **会话列表是空的**
 让机器人在目标群/私聊各收一条消息，或挂 aiocqhttp 后点「刷新会话列表」。
@@ -133,3 +152,14 @@ QQ 官方适配器在缺少 `msg_id` 时，只有 `_session_scene` 记录为 `gr
 
 **QQ 群里收不到**
 检查机器人是否具备主动消息权限、当日额度是否用尽；日志中若出现 `No cached msg_id for session`，说明场景预热未生效，请确认插件版本与适配器版本匹配。
+
+## 开发
+
+- 提交前用 `ruff check` 与 `ruff format` 检查；
+- 视图脚本使用外部 `type="module"`，不写内联脚本；
+- 不使用 `requests`，网络请求走异步库；
+- 持久化数据只写 `data/plugin_data/` 下的插件目录，不写插件自身目录。
+
+## 许可
+
+[MIT](LICENSE)

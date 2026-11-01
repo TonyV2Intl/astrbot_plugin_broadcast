@@ -2,9 +2,13 @@
 
 架构说明：
     v2 起配置不再堆在 ``_conf_schema.json`` 里，而是由插件自带的
-    Pages 页面（``pages/settings/``）管理，数据落在
+    可视化视图（``views/settings/``）管理，数据落在
     ``data/plugin_data/astrbot_plugin_broadcast/settings.json``。
     ``_conf_schema.json`` 只保留一个全局启用开关。
+
+    视图通过 ``window.AstrBotPluginView`` bridge 调用下列后端接口，
+    接口一律用 ``astrbot.api.web`` 的 ``request`` / ``json_response`` /
+    ``error_response`` 读写，不直接接触底层 Web 框架对象。
 
 指令：
     /broadcast <消息内容>   向目标会话广播（管理员）
@@ -40,14 +44,7 @@ from zoneinfo import ZoneInfo
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
-
-try:  # AstrBot >= 4.24.2 提供的插件 Web API 工具
-    from astrbot.api import web as _web
-
-    WEB_API_AVAILABLE = True
-except Exception:  # pragma: no cover - 旧版本降级
-    _web = None  # type: ignore[assignment]
-    WEB_API_AVAILABLE = False
+from astrbot.api.web import error_response, json_response, request
 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -133,7 +130,7 @@ class ScheduleSettings:
         }
 
     @classmethod
-    def from_dict(cls, raw: Any, base: "ScheduleSettings | None" = None):
+    def from_dict(cls, raw: Any, base: ScheduleSettings | None = None):
         base = base or cls()
         if raw is None:
             return base
@@ -194,7 +191,7 @@ class Settings:
         }
 
     @classmethod
-    def from_dict(cls, raw: Any, base: "Settings | None" = None) -> "Settings":
+    def from_dict(cls, raw: Any, base: Settings | None = None) -> Settings:
         base = base or cls()
         if not isinstance(raw, dict):
             raise SettingsError("配置必须是 JSON 对象")
@@ -249,7 +246,7 @@ class Settings:
             auto_register=bool(raw.get("auto_register", base.auto_register)),
         )
 
-    def replace(self, **kwargs: Any) -> "Settings":
+    def replace(self, **kwargs: Any) -> Settings:
         data = self.to_dict()
         for key, value in kwargs.items():
             if key == "schedule" and isinstance(value, ScheduleSettings):
@@ -405,7 +402,6 @@ class OfficialBroadcastPlugin(Star):
         self._settings_path = self._data_dir / "settings.json"
         self._registry_path = self._data_dir / "sessions.json"
         self._state_path = self._data_dir / "state.json"
-        self._legacy_registry_path = self._data_dir / "groups.json"
 
         self._settings = Settings()
         self._registry: dict[str, dict[str, Any]] = {}
@@ -477,8 +473,9 @@ class OfficialBroadcastPlugin(Star):
     # 配置读写
     # ------------------------------------------------------------------ #
     def _load_settings(self) -> None:
+        """读取 settings.json；不存在时直接落一份默认配置。"""
         if not self._settings_path.exists():
-            self._settings = self._migrate_legacy_config()
+            self._settings = Settings()
             try:
                 self._atomic_write(self._settings_path, self._settings.to_dict())
                 logger.info("[broadcast] 已生成默认配置 settings.json")
@@ -497,44 +494,6 @@ class OfficialBroadcastPlugin(Star):
             logger.exception("[broadcast] 读取配置失败，回退默认值")
             self._backup_broken(self._settings_path)
             self._settings = Settings()
-
-    def _migrate_legacy_config(self) -> Settings:
-        """把旧版 _conf_schema.json 里的字段一次性迁移到 settings.json。"""
-        settings = Settings()
-        try:
-            raw = dict(self.config) if self.config else {}
-        except Exception:
-            return settings
-        if not raw:
-            return settings
-        try:
-            settings.admin_uids = _parse_str_list(raw.get("admin_uids", []))
-            settings.exclude_umos = _parse_umo_list(
-                raw.get("exclude_umos", []), "exclude_umos"
-            )
-            settings.send_interval = min(
-                max(float(raw.get("send_interval", DEFAULT_INTERVAL)), 0.0),
-                MAX_INTERVAL,
-            )
-            settings.max_per_minute = max(
-                0, min(int(raw.get("max_per_minute", DEFAULT_MAX_PER_MINUTE)), 60)
-            )
-            settings.daily_limit = max(
-                0, int(raw.get("daily_limit", DEFAULT_DAILY_LIMIT))
-            )
-            settings.enable_schedule = bool(raw.get("enable_schedule", False))
-            settings.schedule_message = str(raw.get("schedule_message", "") or "")
-            settings.timezone = str(raw.get("timezone", DEFAULT_TIMEZONE))
-            settings.auto_register = bool(raw.get("auto_discover", True))
-            cron = str(raw.get("schedule_cron", "") or "").strip()
-            if cron:
-                parsed = _cron_to_schedule(cron)
-                if parsed:
-                    settings.schedule = parsed
-            logger.info("[broadcast] 已从旧版插件配置迁移设置")
-        except Exception:
-            logger.warning("[broadcast] 旧配置迁移失败，使用默认设置", exc_info=True)
-        return settings
 
     def _save_settings(self) -> None:
         self._atomic_write(self._settings_path, self._settings.to_dict())
@@ -556,8 +515,6 @@ class OfficialBroadcastPlugin(Star):
     # ------------------------------------------------------------------ #
     def _load_registry(self) -> None:
         path = self._registry_path
-        if not path.exists() and self._legacy_registry_path.exists():
-            path = self._legacy_registry_path
         if not path.exists():
             return
         try:
@@ -1066,12 +1023,11 @@ class OfficialBroadcastPlugin(Star):
     # Web API
     # ------------------------------------------------------------------ #
     def _register_web_apis(self) -> None:
-        if not WEB_API_AVAILABLE:
-            logger.warning(
-                "[broadcast] 当前 AstrBot 版本不支持 astrbot.api.web，"
-                "可视化配置页不可用（需要 4.24.2 及以上）"
-            )
-            return
+        """注册视图后端接口。
+
+        路由必须带插件名前缀；视图侧的 endpoint 不带前缀，由
+        Dashboard 转发到 ``/api/v1/plugins/extensions/<plugin>/...``。
+        """
         routes = (
             (
                 f"/{PLUGIN_NAME}/config/get",
@@ -1117,7 +1073,6 @@ class OfficialBroadcastPlugin(Star):
             if self._settings.enable_schedule
             else "",
             "last_result": self._state.get("last_result"),
-            "web_api": WEB_API_AVAILABLE,
             "scheduler_available": SCHEDULER_AVAILABLE,
             "aiocqhttp": [pid for pid, _ in self._aiocqhttp_instances()],
         }
@@ -1148,31 +1103,30 @@ class OfficialBroadcastPlugin(Star):
         }
 
     async def api_get_config(self):
+        """GET config/get：返回配置、会话列表与运行概览。"""
         try:
-            return _web.json_response(await self._api_payload())
+            return json_response(await self._api_payload())
         except Exception as exc:
             logger.exception("[broadcast] 读取配置失败")
-            return _web.error_response(f"读取配置失败：{exc}", status_code=500)
+            return error_response(f"读取配置失败：{exc}", status_code=500)
 
     async def api_save_config(self):
-        try:
-            payload = await _web.request.json(default={})
-        except Exception as exc:
-            return _web.error_response(f"请求体解析失败：{exc}")
+        """POST config/save：校验并保存配置，随即重建定时任务。"""
+        payload = await request.json(default={})
         if not isinstance(payload, dict):
-            return _web.error_response("请求体必须是 JSON 对象")
+            return error_response("请求体必须是 JSON 对象")
 
         try:
             settings = Settings.from_dict(payload, base=self._settings)
         except SettingsError as exc:
-            return _web.error_response(str(exc))
+            return error_response(str(exc))
 
         self._settings = settings
         try:
             self._save_settings()
         except Exception as exc:
             logger.exception("[broadcast] 保存配置失败")
-            return _web.error_response(f"写入配置文件失败：{exc}", status_code=500)
+            return error_response(f"写入配置文件失败：{exc}", status_code=500)
 
         if "enabled" in payload:
             self._set_enabled(bool(payload.get("enabled")))
@@ -1184,13 +1138,11 @@ class OfficialBroadcastPlugin(Star):
         data = await self._api_payload()
         data["schedule_message"] = message
         data["schedule_ok"] = ok
-        return _web.json_response(data)
+        return json_response(data)
 
     async def api_refresh_sessions(self):
-        try:
-            payload = await _web.request.json(default={})
-        except Exception:
-            payload = {}
+        """POST config/refresh：重新收集会话，可顺带向 aiocqhttp 拉取。"""
+        payload = await request.json(default={})
         if not isinstance(payload, dict):
             payload = {}
         refresh_remote = bool(payload.get("remote", True))
@@ -1198,8 +1150,8 @@ class OfficialBroadcastPlugin(Star):
             sessions = await self._collect_sessions(refresh=refresh_remote)
         except Exception as exc:
             logger.exception("[broadcast] 刷新会话失败")
-            return _web.error_response(f"刷新会话失败：{exc}", status_code=500)
-        return _web.json_response(
+            return error_response(f"刷新会话失败：{exc}", status_code=500)
+        return json_response(
             {
                 "sessions": [s.to_dict() for s in sessions],
                 "platforms": sorted({s.platform for s in sessions}),
@@ -1325,8 +1277,6 @@ class OfficialBroadcastPlugin(Star):
                 lines.append(f"⚠️ {overview['schedule_error']}")
         if missing:
             lines.append(f"⚠️ 白名单中 {len(missing)} 个 UMO 当前未发现")
-        if not overview["web_api"]:
-            lines.append("⚠️ 当前 AstrBot 版本不支持可视化配置页")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("broadcast_list")
@@ -1370,7 +1320,7 @@ class OfficialBroadcastPlugin(Star):
         )
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
-    async def record_group(self, event: AstrMessageEvent):
+    async def record_session(self, event: AstrMessageEvent):
         """收到任意消息时登记会话，便于后续广播。"""
         if not self._settings.auto_register:
             return
@@ -1476,26 +1426,3 @@ def _split_umo(umo: str) -> tuple[str, str, str]:
     if len(parts) < 3:
         return (parts[0] if parts else "", parts[1] if len(parts) > 1 else "", umo)
     return parts[0], parts[1], parts[2]
-
-
-def _cron_to_schedule(cron: str) -> ScheduleSettings | None:
-    """把常见的 5 段 Cron 反解成可视化配置（迁移旧配置用）。"""
-    fields = cron.split()
-    if len(fields) != 5:
-        return None
-    minute, hour, dom, month, dow = fields
-    if not (minute.isdigit() and hour.isdigit()):
-        return None
-    if dom != "*" or month != "*":
-        return None
-    time_str = f"{int(hour):02d}:{int(minute):02d}"
-    if dow == "*":
-        return ScheduleSettings(mode="daily", time=time_str)
-    days: list[int] = []
-    for item in dow.split(","):
-        part = item.strip()
-        if part.isdigit() and 0 <= int(part) <= 6:
-            days.append(int(part))
-    if not days:
-        return None
-    return ScheduleSettings(mode="weekly", time=time_str, weekdays=sorted(set(days)))

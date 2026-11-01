@@ -2,8 +2,9 @@
  * AstrBot 广播插件 · 可视化配置台
  *
  * 与后端通过 AstrBot 注入的 bridge 通信：
- *   window.AstrBotPluginPage.apiGet(endpoint, params)
- *   window.AstrBotPluginPage.apiPost(endpoint, body)
+ *   window.AstrBotPluginView.apiGet(endpoint, params)
+ *   window.AstrBotPluginView.apiPost(endpoint, body)
+ *   window.AstrBotPluginPage 是其向后兼容别名。
  * endpoint 不需要带插件名，Dashboard 会自动补全
  * /api/v1/plugins/extensions/<plugin_name>/ 前缀。
  */
@@ -35,11 +36,12 @@ const state = {
 /* ------------------------------------------------------------------ */
 async function waitForBridge() {
   for (let i = 0; i < 80; i += 1) {
-    if (window.AstrBotPluginPage) return window.AstrBotPluginPage;
+    const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
+    if (bridge) return bridge;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(
-    "没有找到 AstrBot 插件页面桥接。请确认 AstrBot 版本 ≥ 4.24.2，并重载插件。"
+    "没有找到 AstrBot 插件视图桥接（AstrBotPluginView）。请确认 AstrBot ≥ 4.24.2，并重载插件。"
   );
 }
 
@@ -168,8 +170,9 @@ function renderOverview() {
   const banner = $("runtime-banner");
   const problems = [];
   if (overview.schedule_error) problems.push(overview.schedule_error);
-  if (!overview.web_api) problems.push("当前 AstrBot 版本不支持可视化配置页");
-  if (!overview.scheduler_available) problems.push("未安装 apscheduler，定时广播不可用");
+  if (overview.scheduler_available === false) {
+    problems.push("未安装 apscheduler，定时广播不可用");
+  }
   if (overview.busy) problems.push("当前有广播任务正在执行");
 
   if (problems.length) {
@@ -695,4 +698,8 @@ async function boot() {
   }
 }
 
-document.addEventListener("DOMContentLoaded", boot);
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
+}
