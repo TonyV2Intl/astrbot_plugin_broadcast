@@ -1,7 +1,7 @@
 {
   "metadata": {
     "display_name": "AstrBot Broadcaster",
-    "desc": "Broadcast one message to many conversations, with a built-in settings view, scheduled jobs, target allowlists and send rate limiting."
+    "desc": "Broadcast one message to many conversations, with a built-in settings view, scheduled jobs, per-session targets and send rate limiting."
   },
   "views": {
     "settings": {

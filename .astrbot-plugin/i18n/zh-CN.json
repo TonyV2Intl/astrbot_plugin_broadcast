@@ -1,7 +1,7 @@
 {
   "metadata": {
     "display_name": "AstrBot广播器",
-    "desc": "向多个会话广播消息的 AstrBot 插件，带独立可视化配置台、定时任务、目标白名单与发送限速。"
+    "desc": "向多个会话广播消息的 AstrBot 插件，带独立可视化配置台、定时任务、目标会话勾选与发送限速。"
   },
   "views": {
     "settings": {

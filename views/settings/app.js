@@ -153,8 +153,6 @@ function makeIcon(kind) {
   svg.setAttribute("stroke-linecap", "round");
   svg.setAttribute("stroke-linejoin", "round");
   const ICONS = {
-    ban: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18", "M5.6 5.6l12.8 12.8"],
-    restore: ["M9 14 4 9l5-5", "M4 9h11a5 5 0 0 1 0 10h-3"],
     trash: [
       "M4 7h16",
       "M6.5 7l.9 11.2A2 2 0 0 0 9.4 20h5.2a2 2 0 0 0 2-1.8L17.5 7",
@@ -163,7 +161,7 @@ function makeIcon(kind) {
       "M13.5 11v5",
     ],
   };
-  const paths = ICONS[kind] || ICONS.ban;
+  const paths = ICONS[kind] || ICONS.trash;
   paths.forEach((d) => {
     const path = document.createElementNS(NS, "path");
     path.setAttribute("d", d);
@@ -176,10 +174,6 @@ function targetSet() {
   return new Set(state.settings?.target_umos || []);
 }
 
-function excludeSet() {
-  return new Set(state.settings?.exclude_umos || []);
-}
-
 /* ------------------------------------------------------------------ */
 /* 渲染                                                                */
 /* ------------------------------------------------------------------ */
@@ -187,18 +181,10 @@ function renderOverview() {
   const overview = state.overview || {};
   const settings = state.settings || {};
   const sessions = state.sessions || [];
-  const excluded = excludeSet();
   const targets = targetSet();
 
-  const eligible = sessions.filter((s) => {
-    if (excluded.has(s.umo)) return false;
-    if (targets.size === 0) return true;
-    return targets.has(s.umo);
-  }).length;
-
   $("stat-total").textContent = String(sessions.length);
-  $("stat-target").innerHTML = `${targets.size > 0 ? targets.size : eligible}` +
-    `<small> / ${sessions.length}</small>`;
+  $("stat-target").innerHTML = `${targets.size}` + `<small> / ${sessions.length}</small>`;
   $("stat-quota").innerHTML =
     settings.daily_limit > 0
       ? `${overview.today_sent ?? 0}<small> / ${settings.daily_limit}</small>`
@@ -235,17 +221,17 @@ function renderOverview() {
 
 function renderModeBanner() {
   const banner = $("mode-banner");
-  const excluded = excludeSet();
   const targets = targetSet();
-  const total = state.sessions.filter((s) => !excluded.has(s.umo)).length;
+  const total = state.sessions.length;
 
   if (targets.size === 0) {
-    banner.className = "banner";
-    banner.innerHTML = `当前模式：<strong>全部会话</strong>。未勾选任何会话，将向 ${total} 个可用会话广播。勾选后切换为“仅向选中会话”模式。`;
+    banner.className = "banner warn";
+    banner.innerHTML =
+      `当前没有勾选任何会话，<strong>广播不会发送</strong>。` +
+      `请在下方勾选目标（共 ${total} 个已知会话）。`;
   } else {
-    const effective = [...targets].filter((umo) => !excluded.has(umo)).length;
     banner.className = "banner ok";
-    banner.innerHTML = `当前模式：<strong>仅向选中会话</strong>。已选 ${targets.size} 个，实际可发送 ${effective} 个。`;
+    banner.innerHTML = `将向 <strong>${targets.size}</strong> 个已勾选的会话广播。新发现的会话会自动勾选。`;
   }
 }
 
@@ -568,16 +554,14 @@ function filteredSessions() {
   const { q, platform, type, status } = state.filters;
   const keyword = q.trim().toLowerCase();
   const targets = targetSet();
-  const excluded = excludeSet();
 
   return state.sessions.filter((session) => {
     if (platform && session.platform !== platform) return false;
     if (type && session.message_type !== type) return false;
 
-    const selected = targets.size === 0 ? !excluded.has(session.umo) : targets.has(session.umo);
+    const selected = targets.has(session.umo);
     if (status === "selected" && !selected) return false;
     if (status === "unselected" && selected) return false;
-    if (status === "excluded" && !excluded.has(session.umo)) return false;
 
     if (!keyword) return true;
     return (
@@ -592,7 +576,6 @@ function renderSessions() {
   const list = $("session-list");
   const view = filteredSessions();
   const targets = targetSet();
-  const excluded = excludeSet();
   list.innerHTML = "";
 
   if (!view.length) {
@@ -605,18 +588,15 @@ function renderSessions() {
   } else {
     const fragment = document.createDocumentFragment();
     view.slice(0, MAX_RENDER_ROWS).forEach((session) => {
-      const isExcluded = excluded.has(session.umo);
-      const isSelected =
-        targets.size === 0 ? !isExcluded : targets.has(session.umo);
+      const isSelected = targets.has(session.umo);
 
       const row = document.createElement("div");
-      row.className = "session-row" + (isExcluded ? " excluded" : "");
+      row.className = "session-row";
       row.dataset.umo = session.umo;
 
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.checked = isSelected;
-      checkbox.disabled = isExcluded;
       checkbox.addEventListener("change", () => {
         toggleInclude(session.umo, checkbox.checked);
       });
@@ -641,17 +621,7 @@ function renderSessions() {
         "badge " + (session.message_type === "GroupMessage" ? "group" : "private");
       typeBadge.textContent = messageTypeLabel(session.message_type);
 
-      const excludeBtn = document.createElement("button");
-      excludeBtn.type = "button";
-      excludeBtn.className = "icon-btn";
-      excludeBtn.title = isExcluded ? "取消排除" : "永不向该会话广播";
-      excludeBtn.appendChild(makeIcon(isExcluded ? "restore" : "ban"));
-      excludeBtn.addEventListener("click", (event) => {
-        event.stopPropagation();
-        toggleExclude(session.umo);
-      });
-
-      row.append(checkbox, main, platformBadge, typeBadge, excludeBtn);
+      row.append(checkbox, main, platformBadge, typeBadge);
       fragment.appendChild(row);
     });
     list.appendChild(fragment);
@@ -700,7 +670,7 @@ function renderAll() {
 function updateSaveSummary() {
   const settings = state.settings || {};
   const targets = targetSet();
-  const mode = targets.size ? `仅发 ${targets.size} 个会话` : "全部会话";
+  const mode = targets.size ? `已选 ${targets.size} 个会话` : "未选会话（不会广播）";
   const active = (state.schedules || []).filter((task) => task.enabled).length;
   const schedule = active ? `${active} 个定时任务` : "定时未开启";
   $("save-summary").textContent = `${mode}　·　${schedule}　·　间隔 ${settings.send_interval}s`;
@@ -710,56 +680,27 @@ function updateSaveSummary() {
 /* 交互                                                                */
 /* ------------------------------------------------------------------ */
 function toggleInclude(umo, checked) {
-  const excluded = excludeSet();
-  let set = targetSet();
-
-  if (set.size === 0) {
-    // 从“全部”模式物化：先把当前所有可用会话视为已选
-    state.sessions.forEach((session) => {
-      if (!excluded.has(session.umo)) set.add(session.umo);
-    });
-  }
-
+  const set = targetSet();
   if (checked) {
-    if (excluded.has(umo)) return;
     set.add(umo);
   } else {
     set.delete(umo);
   }
-
   applyTargets(set);
 }
 
 function applyTargets(set) {
-  if (set.size === 0) {
-    state.settings.target_umos = [];
-    toast("已取消全部选择：当前将向全部会话广播");
-  } else {
-    const ordered = [];
-    state.sessions.forEach((session) => {
-      if (set.has(session.umo)) ordered.push(session.umo);
-    });
-    set.forEach((umo) => {
-      if (!ordered.includes(umo)) ordered.push(umo);
-    });
-    state.settings.target_umos = ordered;
+  const ordered = [];
+  state.sessions.forEach((session) => {
+    if (set.has(session.umo)) ordered.push(session.umo);
+  });
+  set.forEach((umo) => {
+    if (!ordered.includes(umo)) ordered.push(umo);
+  });
+  state.settings.target_umos = ordered;
+  if (ordered.length === 0) {
+    toast("已取消全部勾选：广播不会发送");
   }
-  renderSessions();
-}
-
-function toggleExclude(umo) {
-  const set = excludeSet();
-  if (set.has(umo)) {
-    set.delete(umo);
-  } else {
-    set.add(umo);
-    const targets = targetSet();
-    if (targets.has(umo)) {
-      targets.delete(umo);
-      state.settings.target_umos = [...targets];
-    }
-  }
-  state.settings.exclude_umos = [...set];
   renderSessions();
 }
 
@@ -768,7 +709,7 @@ function collectForm() {
   return {
     admin_uids: splitList($("admin-uids").value),
     target_umos: settings.target_umos || [],
-    exclude_umos: settings.exclude_umos || [],
+    seen_umos: settings.seen_umos || [],
     send_interval: Number($("send-interval").value || 0),
     max_per_minute: Number($("max-per-minute").value || 0),
     daily_limit: Number($("daily-limit").value || 0),
@@ -887,16 +828,14 @@ function bindEvents() {
 
   $("select-all").addEventListener("click", () => {
     const set = targetSet();
-    filteredSessions().forEach((session) => {
-      if (!excludeSet().has(session.umo)) set.add(session.umo);
-    });
+    filteredSessions().forEach((session) => set.add(session.umo));
     applyTargets(set);
     toast(`已选中 ${set.size} 个会话`);
   });
 
   $("clear-all").addEventListener("click", () => {
     if (targetSet().size === 0) {
-      toast("当前已经是全部会话模式");
+      toast("当前没有勾选任何会话");
       return;
     }
     applyTargets(new Set());

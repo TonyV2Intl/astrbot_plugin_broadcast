@@ -532,11 +532,6 @@
         background: var(--bg);
       }
 
-      .session-row.excluded {
-        opacity: 0.62;
-        background: var(--danger-soft);
-      }
-
       .session-row input[type="checkbox"] {
         width: 16px;
         height: 16px;
@@ -555,10 +550,6 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-      }
-
-      .session-row.excluded .name {
-        text-decoration: line-through;
       }
 
       .session-row .umo {
@@ -616,10 +607,6 @@
         background: var(--danger-soft);
         color: var(--danger);
         border-color: transparent;
-      }
-
-      .session-row.excluded .icon-btn {
-        color: var(--danger);
       }
 
       .list-foot {
@@ -842,7 +829,7 @@
         <section class="card">
           <h2>目标会话</h2>
           <p class="desc">
-            勾选表示只向选中的会话广播；一个都不勾时向全部会话广播（排除名单除外）。
+            勾选要广播的会话；新发现的会话会自动勾选。取消勾选即不再向该会话广播。
           </p>
 
           <div id="mode-banner" class="banner"></div>
@@ -861,7 +848,6 @@
               <button type="button" data-status="all" class="active">全部</button>
               <button type="button" data-status="selected">已选</button>
               <button type="button" data-status="unselected">未选</button>
-              <button type="button" data-status="excluded">已排除</button>
             </div>
           </div>
 
@@ -875,7 +861,7 @@
           <div class="session-list" id="session-list"></div>
           <div class="list-foot">
             <span id="list-count">—</span>
-            <span>行尾按钮可切换“永不发送”，排除的会话不参与任何广播</span>
+            <span>勾选=会广播；新会话自动勾选，取消勾选后不会再被自动加回</span>
           </div>
         </section>
 

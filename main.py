@@ -247,7 +247,7 @@ class Settings:
 
     admin_uids: list[str] = field(default_factory=list)
     target_umos: list[str] = field(default_factory=list)
-    exclude_umos: list[str] = field(default_factory=list)
+    seen_umos: list[str] = field(default_factory=list)
     send_interval: float = DEFAULT_INTERVAL
     max_per_minute: int = DEFAULT_MAX_PER_MINUTE
     daily_limit: int = DEFAULT_DAILY_LIMIT
@@ -259,7 +259,7 @@ class Settings:
         return {
             "admin_uids": list(self.admin_uids),
             "target_umos": list(self.target_umos),
-            "exclude_umos": list(self.exclude_umos),
+            "seen_umos": list(self.seen_umos),
             "send_interval": self.send_interval,
             "max_per_minute": self.max_per_minute,
             "daily_limit": self.daily_limit,
@@ -277,9 +277,12 @@ class Settings:
         target = _parse_umo_list(
             raw.get("target_umos", base.target_umos), "target_umos"
         )
-        exclude = _parse_umo_list(
-            raw.get("exclude_umos", base.exclude_umos), "exclude_umos"
-        )
+        if "seen_umos" in raw:
+            seen = _parse_umo_list(raw.get("seen_umos"), "seen_umos")
+        else:
+            # 旧配置没有 seen_umos：把排除名单原样挪进来，
+            # 升级后这些会话不会被「自动勾选」重新捡回去。
+            seen = _parse_umo_list(raw.get("exclude_umos"), "exclude_umos")
 
         interval = _parse_float(
             raw.get("send_interval", base.send_interval), "发送间隔"
@@ -304,7 +307,7 @@ class Settings:
         return cls(
             admin_uids=admin_uids,
             target_umos=target,
-            exclude_umos=exclude,
+            seen_umos=list(dict.fromkeys([*base.seen_umos, *seen])),
             send_interval=round(interval, 2),
             max_per_minute=max_per_minute,
             daily_limit=daily_limit,
@@ -810,35 +813,57 @@ class OfficialBroadcastPlugin(Star):
     # ------------------------------------------------------------------ #
     # 目标解析
     # ------------------------------------------------------------------ #
+    def _adopt_sessions(self, sessions: list[SessionInfo]) -> list[str]:
+        """把首次发现的会话自动加入广播名单，返回新增的 UMO。
+
+        ``seen_umos`` 记录出现过的会话，因此手动取消勾选的会话
+        不会在下次刷新时被重新勾上；只有真正的新会话才会自动选中。
+        """
+        seen = set(self._settings.seen_umos)
+        fresh = [s.umo for s in sessions if s.umo not in seen]
+        if not fresh:
+            return []
+
+        targets = list(self._settings.target_umos)
+        added: list[str] = []
+        for umo in fresh:
+            if umo not in targets:
+                targets.append(umo)
+                added.append(umo)
+        self._settings.target_umos = targets
+        self._settings.seen_umos = list(
+            dict.fromkeys([*self._settings.seen_umos, *(s.umo for s in sessions)])
+        )
+        self._save_settings()
+        if added:
+            logger.info(f"[broadcast] 自动勾选 {len(added)} 个新会话")
+        return added
+
     async def _resolve_targets(
         self, settings: Settings, refresh: bool = False
     ) -> tuple[list[SessionInfo], list[str]]:
-        """返回 (实际发送目标, 白名单中未发现的 UMO)。"""
+        """返回 (实际发送目标, 已知会话中找不到的 UMO)。"""
         sessions = await self._collect_sessions(refresh=refresh)
+        self._adopt_sessions(sessions)
+        settings = self._settings
         index = {s.umo: s for s in sessions}
-        exclude = set(settings.exclude_umos)
 
-        if settings.target_umos:
-            targets: list[SessionInfo] = []
-            missing: list[str] = []
-            for umo in settings.target_umos:
-                if umo in exclude:
-                    continue
-                info = index.get(umo)
-                if info is None:
-                    platform, message_type, session_id = _split_umo(umo)
-                    info = SessionInfo(
-                        umo=umo,
-                        platform=platform,
-                        message_type=message_type,
-                        session_id=session_id,
-                        display_name=session_id,
-                    )
-                    missing.append(umo)
-                targets.append(info)
-            return targets, missing
-
-        return [s for s in sessions if s.umo not in exclude], []
+        targets: list[SessionInfo] = []
+        missing: list[str] = []
+        for umo in settings.target_umos:
+            info = index.get(umo)
+            if info is None:
+                platform, message_type, session_id = _split_umo(umo)
+                info = SessionInfo(
+                    umo=umo,
+                    platform=platform,
+                    message_type=message_type,
+                    session_id=session_id,
+                    display_name=session_id,
+                )
+                missing.append(umo)
+            targets.append(info)
+        return targets, missing
 
     # ------------------------------------------------------------------ #
     # 发送
@@ -1233,14 +1258,10 @@ class OfficialBroadcastPlugin(Star):
 
     async def _api_payload(self) -> dict[str, Any]:
         sessions = await self._collect_sessions(refresh=False)
+        self._adopt_sessions(sessions)
         settings = self._settings
         target = set(settings.target_umos)
-        exclude = set(settings.exclude_umos)
-        eligible = [
-            s
-            for s in sessions
-            if s.umo not in exclude and (not target or s.umo in target)
-        ]
+        eligible = [s for s in sessions if s.umo in target]
         return {
             "settings": settings.to_dict(),
             "sessions": [s.to_dict() for s in sessions],
@@ -1250,9 +1271,7 @@ class OfficialBroadcastPlugin(Star):
             "summary": {
                 "total": len(sessions),
                 "selected": len(settings.target_umos),
-                "excluded": len(settings.exclude_umos),
                 "eligible": len(eligible),
-                "mode": "targeted" if settings.target_umos else "all",
             },
         }
 
@@ -1407,8 +1426,7 @@ class OfficialBroadcastPlugin(Star):
         lines = [
             "📊 广播运行状态",
             f"已知会话：{len(sessions)} 个｜本次目标：{len(targets)} 个",
-            f"目标模式：{'白名单' if settings.target_umos else '全部会话'}",
-            f"排除名单：{len(settings.exclude_umos)} 个",
+            f"已勾选：{len(settings.target_umos)} 个会话",
             f"发送间隔：{settings.send_interval:g}s｜"
             f"限速：{settings.max_per_minute or '不限'}/分钟",
             f"今日已发：{overview['today_sent']}"
@@ -1437,7 +1455,7 @@ class OfficialBroadcastPlugin(Star):
         if overview["schedule_error"]:
             lines.append(f"⚠️ {overview['schedule_error']}")
         if missing:
-            lines.append(f"⚠️ 白名单中 {len(missing)} 个 UMO 当前未发现")
+            lines.append(f"⚠️ 有 {len(missing)} 个已勾选的 UMO 当前未发现")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("broadcast_list")
@@ -1448,19 +1466,15 @@ class OfficialBroadcastPlugin(Star):
             return
 
         sessions = await self._collect_sessions()
+        self._adopt_sessions(sessions)
         if not sessions:
             yield event.plain_result(await self._empty_targets_hint())
             return
 
         target = set(self._settings.target_umos)
-        exclude = set(self._settings.exclude_umos)
-        lines = [f"📋 已发现 {len(sessions)} 个会话（最多显示 40 条）"]
+        lines = [f"📋 已发现 {len(sessions)} 个会话（✅ 已勾选，最多显示 40 条）"]
         for session in sessions[:40]:
-            mark = (
-                "🚫"
-                if session.umo in exclude
-                else ("✅" if not target or session.umo in target else "⬜")
-            )
+            mark = "✅" if session.umo in target else "⬜"
             lines.append(f"{mark} {session.display_name}｜{session.umo}")
         if len(sessions) > 40:
             lines.append(f"…… 其余 {len(sessions) - 40} 条请到插件配置页查看")
@@ -1515,12 +1529,11 @@ class OfficialBroadcastPlugin(Star):
                 "2. AstrBot 数据库中的已知会话（与 WebUI 会话列表同源）。\n\n"
                 "如果仍然为空：\n"
                 "· 在目标群/私聊里和机器人说一句话，AstrBot 会自动记下会话名；\n"
-                "· 或挂载 aiocqhttp 后在插件配置页点「刷新会话」；\n"
-                "· 或在配置页把完整 UMO 手动加入白名单。"
+                "· 或挂载 aiocqhttp 后在插件配置页点「刷新会话」。"
             )
         return (
-            f"已知 {len(sessions)} 个会话，但都被白名单/排除名单过滤掉了。\n"
-            "请到插件配置页检查目标会话设置。"
+            f"已知 {len(sessions)} 个会话，但一个都没有勾选。\n"
+            "请到插件配置页的「目标会话」里勾选要广播的会话。"
         )
 
     def _format_report(self, result: BroadcastResult) -> str:
@@ -1534,7 +1547,7 @@ class OfficialBroadcastPlugin(Star):
             lines.append(f"耗时：{result.duration:.1f} 秒")
         if result.missing_targets:
             lines.append(
-                f"⚠️ 白名单中 {len(result.missing_targets)} 个 UMO 未在会话列表中发现，"
+                f"⚠️ 有 {len(result.missing_targets)} 个已勾选 UMO 未在会话列表中发现，"
                 "已尝试直接发送"
             )
         if result.failures:
