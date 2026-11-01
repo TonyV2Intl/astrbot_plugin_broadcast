@@ -1569,8 +1569,16 @@ class OfficialBroadcastPlugin(Star):
             return
 
         users = self._mentioned_users(event)
-        if not users or self._has_extra_text(event):
-            yield event.plain_result("用法：/broadcast_auth @某人")
+        if not users:
+            self._log_mention_probe(event)
+            yield event.plain_result(
+                "用法：/broadcast_auth @某人\n（没有从这条消息里解析到被 @ 的用户）"
+            )
+            return
+        if self._has_extra_text(event):
+            yield event.plain_result(
+                "用法：/broadcast_auth @某人\n（指令后不要带其他文字）"
+            )
             return
 
         admins = list(self._settings.admin_uids)
@@ -1723,6 +1731,38 @@ class OfficialBroadcastPlugin(Star):
         except Exception:
             self_id = ""
         return [(uid, name) for uid, name in found if uid != self_id]
+
+    def _log_mention_probe(self, event: AstrMessageEvent) -> None:
+        """记录一次 @ 解析诊断，便于定位不同平台的消息结构差异。"""
+        try:
+            message_obj = getattr(event, "message_obj", None)
+            raw = getattr(message_obj, "raw_message", None)
+            mentions = getattr(raw, "mentions", None)
+            chain_sample = []
+            for comp in self._message_components(event)[:8]:
+                if isinstance(comp, dict):
+                    chain_sample.append(comp)
+                else:
+                    chain_sample.append(
+                        {
+                            "type": self._component_type(comp),
+                            "qq": getattr(comp, "qq", ""),
+                            "name": getattr(comp, "name", ""),
+                        }
+                    )
+            get_name = getattr(event, "get_platform_name", None)
+            get_self = getattr(event, "get_self_id", None)
+            logger.info(
+                "[broadcast] @ 解析为空，诊断信息："
+                f"platform={get_name() if callable(get_name) else ''} "
+                f"self_id={get_self() if callable(get_self) else ''} "
+                f"message_str={str(getattr(event, 'message_str', ''))[:200]!r} "
+                f"chain={chain_sample!r} "
+                f"mentions={str(mentions)[:500]!r} "
+                f"raw_content={str(getattr(raw, 'content', ''))[:300]!r}"
+            )
+        except Exception:
+            logger.info("[broadcast] @ 解析为空，诊断信息采集失败", exc_info=True)
 
     def _has_extra_text(self, event: AstrMessageEvent) -> bool:
         """指令后除 @ 之外是否还有别的文字。"""
