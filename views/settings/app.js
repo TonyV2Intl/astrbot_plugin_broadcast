@@ -230,8 +230,11 @@ function renderModeBanner() {
       `当前没有勾选任何会话，<strong>广播不会发送</strong>。` +
       `请在下方勾选目标（共 ${total} 个已知会话）。`;
   } else {
+    const auto = state.settings?.auto_select_new !== false;
     banner.className = "banner ok";
-    banner.innerHTML = `将向 <strong>${targets.size}</strong> 个已勾选的会话广播。新发现的会话会自动勾选。`;
+    banner.innerHTML =
+      `将向 <strong>${targets.size}</strong> 个已勾选的会话广播。` +
+      (auto ? "新发现的会话会自动勾选。" : "新发现的会话不会自动勾选。");
   }
 }
 
@@ -660,6 +663,7 @@ function renderAll() {
   $("max-per-minute").value = settings.max_per_minute ?? 20;
   $("daily-limit").value = settings.daily_limit ?? 1000;
   $("timezone").value = settings.timezone || "Asia/Shanghai";
+  $("auto-select-new").checked = settings.auto_select_new !== false;
 
   renderFilters();
   renderSchedules();
@@ -710,6 +714,7 @@ function collectForm() {
     admin_uids: splitList($("admin-uids").value),
     target_umos: settings.target_umos || [],
     seen_umos: settings.seen_umos || [],
+    auto_select_new: $("auto-select-new").checked,
     send_interval: Number($("send-interval").value || 0),
     max_per_minute: Number($("max-per-minute").value || 0),
     daily_limit: Number($("daily-limit").value || 0),
@@ -839,6 +844,13 @@ function bindEvents() {
       return;
     }
     applyTargets(new Set());
+  });
+
+  $("auto-select-new").addEventListener("change", () => {
+    if (state.settings) {
+      state.settings.auto_select_new = $("auto-select-new").checked;
+    }
+    renderModeBanner();
   });
 
   ["send-interval", "max-per-minute", "daily-limit"].forEach((id) => {

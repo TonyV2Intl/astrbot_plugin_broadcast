@@ -14,6 +14,7 @@
     /broadcast_status       查看运行状态
     /broadcast_list         查看已发现的会话
     /broadcast_reload       重载配置并重建定时任务
+    /broadcast_auth @某人   把被 @ 的用户添加为广播管理员（管理员/超管）
 
 说明：
     广播目标不再局限于群聊。插件会综合三处来源发现会话：
@@ -95,6 +96,13 @@ _UMO_RE = re.compile(r"^[^:\s]+:[^:\s]+:.+$")
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+# 各平台在纯文本里遗留的 @ 标记：QQ 官方用 <qqbot-at-user id="..."> 或 <@openid>
+_AT_MARKUP_RE = re.compile(
+    r'<qqbot-at-user\s+id="(?P<a>[^"]+)"\s*/?>|<@!?(?P<b>[^>\s]+)>'
+)
+# 文本形式的 @昵称 / @123456
+_AT_TEXT_RE = re.compile(r"[@＠]\S*")
 
 
 class SettingsError(ValueError):
@@ -248,6 +256,7 @@ class Settings:
     admin_uids: list[str] = field(default_factory=list)
     target_umos: list[str] = field(default_factory=list)
     seen_umos: list[str] = field(default_factory=list)
+    auto_select_new: bool = True
     send_interval: float = DEFAULT_INTERVAL
     max_per_minute: int = DEFAULT_MAX_PER_MINUTE
     daily_limit: int = DEFAULT_DAILY_LIMIT
@@ -260,6 +269,7 @@ class Settings:
             "admin_uids": list(self.admin_uids),
             "target_umos": list(self.target_umos),
             "seen_umos": list(self.seen_umos),
+            "auto_select_new": self.auto_select_new,
             "send_interval": self.send_interval,
             "max_per_minute": self.max_per_minute,
             "daily_limit": self.daily_limit,
@@ -308,6 +318,9 @@ class Settings:
             admin_uids=admin_uids,
             target_umos=target,
             seen_umos=list(dict.fromkeys([*base.seen_umos, *seen])),
+            auto_select_new=_parse_bool(
+                raw.get("auto_select_new", base.auto_select_new), base.auto_select_new
+            ),
             send_interval=round(interval, 2),
             max_per_minute=max_per_minute,
             daily_limit=daily_limit,
@@ -323,6 +336,20 @@ class Settings:
             else:
                 data[key] = value
         return Settings.from_dict(data)
+
+
+def _parse_bool(raw: Any, default: bool) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"true", "1", "yes", "on"}:
+            return True
+        if value in {"false", "0", "no", "off"}:
+            return False
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    return default
 
 
 def _parse_str_list(raw: Any) -> list[str]:
@@ -818,22 +845,25 @@ class OfficialBroadcastPlugin(Star):
 
         ``seen_umos`` 记录出现过的会话，因此手动取消勾选的会话
         不会在下次刷新时被重新勾上；只有真正的新会话才会自动选中。
+        关闭 ``auto_select_new`` 后仍会记录 ``seen_umos``，只是不勾选，
+        这样重新打开开关时不会把历史会话当成新会话一次性补勾。
         """
         seen = set(self._settings.seen_umos)
         fresh = [s.umo for s in sessions if s.umo not in seen]
         if not fresh:
             return []
 
-        targets = list(self._settings.target_umos)
-        added: list[str] = []
-        for umo in fresh:
-            if umo not in targets:
-                targets.append(umo)
-                added.append(umo)
-        self._settings.target_umos = targets
         self._settings.seen_umos = list(
             dict.fromkeys([*self._settings.seen_umos, *(s.umo for s in sessions)])
         )
+        added: list[str] = []
+        if self._settings.auto_select_new:
+            targets = list(self._settings.target_umos)
+            for umo in fresh:
+                if umo not in targets:
+                    targets.append(umo)
+                    added.append(umo)
+            self._settings.target_umos = targets
         self._save_settings()
         if added:
             logger.info(f"[broadcast] 自动勾选 {len(added)} 个新会话")
@@ -1494,6 +1524,48 @@ class OfficialBroadcastPlugin(Star):
             + f"\n会话数：{len(await self._collect_sessions())}"
         )
 
+    @filter.command("broadcast_auth")
+    async def broadcast_auth(self, event: AstrMessageEvent):
+        """把被 @ 的用户添加为广播管理员。"""
+        if not self._can_grant_admin(event):
+            yield event.plain_result(
+                "⚠️ 权限不足：仅广播管理员或 AstrBot 超级管理员可用。"
+            )
+            return
+
+        users = self._mentioned_users(event)
+        if not users or self._has_extra_text(event):
+            yield event.plain_result("用法：/broadcast_auth @某人")
+            return
+
+        admins = list(self._settings.admin_uids)
+        added: list[tuple[str, str]] = []
+        existed: list[tuple[str, str]] = []
+        for uid, name in users:
+            if uid in admins:
+                existed.append((uid, name))
+            else:
+                admins.append(uid)
+                added.append((uid, name))
+
+        if added:
+            self._settings.admin_uids = admins
+            self._save_settings()
+            logger.info(f"[broadcast] 新增 {len(added)} 个管理员")
+
+        def label(uid: str, name: str) -> str:
+            return f"@{name}" if name else f"@{uid}"
+
+        lines = [
+            f"✅ 已成功将 {label(uid, name)} 添加为广播管理员" for uid, name in added
+        ]
+        lines += [
+            f"ℹ️ {label(uid, name)}：该用户已经是管理员了" for uid, name in existed
+        ]
+        if added:
+            lines.append(f"当前管理员共 {len(self._settings.admin_uids)} 个")
+        yield event.plain_result("\n".join(lines))
+
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
@@ -1513,6 +1585,117 @@ class OfficialBroadcastPlugin(Star):
             return bool(event.is_admin())
         except Exception:
             return False
+
+    def _is_super_admin(self, event: AstrMessageEvent) -> bool:
+        """AstrBot 全局管理员（事件 role == admin）。"""
+        try:
+            return bool(event.is_admin())
+        except Exception:
+            return False
+
+    def _can_grant_admin(self, event: AstrMessageEvent) -> bool:
+        """授权指令的门槛：已在广播管理员名单里，或 AstrBot 超级管理员。"""
+        return self._is_admin(event) or self._is_super_admin(event)
+
+    @staticmethod
+    def _message_components(event: AstrMessageEvent) -> list[Any]:
+        getter = getattr(event, "get_messages", None)
+        if not callable(getter):
+            return []
+        try:
+            return list(getter() or [])
+        except Exception:
+            return []
+
+    @staticmethod
+    def _component_type(comp: Any) -> str:
+        if isinstance(comp, dict):
+            kind = comp.get("type", "")
+        else:
+            kind = getattr(comp, "type", "")
+        kind = getattr(kind, "value", kind)
+        return str(kind or "").lower()
+
+    def _raw_mentions(self, event: AstrMessageEvent) -> list[dict[str, str]]:
+        """QQ 官方等平台把非机器人 @ 放在 raw_message.mentions 里。"""
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        mentions = getattr(raw, "mentions", None) or []
+        found: list[dict[str, str]] = []
+        for mention in mentions:
+            if isinstance(mention, dict):
+                if mention.get("is_you") is True:
+                    continue
+                uid = mention.get("id") or mention.get("member_openid") or ""
+                name = mention.get("username") or mention.get("member_name") or ""
+            else:
+                if getattr(mention, "is_you", False) is True:
+                    continue
+                uid = (
+                    getattr(mention, "id", None)
+                    or getattr(mention, "member_openid", None)
+                    or getattr(mention, "user_openid", None)
+                    or ""
+                )
+                name = getattr(mention, "username", "") or getattr(
+                    mention, "member_name", ""
+                )
+            if uid:
+                found.append({"id": str(uid), "name": str(name or "")})
+        return found
+
+    @staticmethod
+    def _raw_text(event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        parts = [
+            str(getattr(event, "message_str", "") or ""),
+            str(getattr(message_obj, "message_str", "") or ""),
+            str(getattr(raw, "content", "") or ""),
+        ]
+        return "\n".join(part for part in parts if part)
+
+    def _mentioned_users(self, event: AstrMessageEvent) -> list[tuple[str, str]]:
+        """按「消息段 → raw.mentions → 文本标记」三路提取被 @ 的用户。"""
+        found: list[tuple[str, str]] = []
+
+        def add(uid: Any, name: Any = "") -> None:
+            value = str(uid or "").strip()
+            if not value or value.lower() in {"all", "everyone"}:
+                return
+            if any(value == item[0] for item in found):
+                return
+            found.append((value, str(name or "").strip()))
+
+        for comp in self._message_components(event):
+            if self._component_type(comp) != "at":
+                continue
+            if isinstance(comp, dict):
+                data = comp.get("data") or {}
+                add(data.get("qq"), data.get("name"))
+            else:
+                add(getattr(comp, "qq", ""), getattr(comp, "name", ""))
+
+        for mention in self._raw_mentions(event):
+            add(mention["id"], mention["name"])
+
+        for match in _AT_MARKUP_RE.finditer(self._raw_text(event)):
+            add(match.group("a") or match.group("b"))
+
+        self_id = ""
+        try:
+            self_id = str(event.get_self_id() or "").strip()
+        except Exception:
+            self_id = ""
+        return [(uid, name) for uid, name in found if uid != self_id]
+
+    def _has_extra_text(self, event: AstrMessageEvent) -> bool:
+        """指令后除 @ 之外是否还有别的文字。"""
+        text = str(getattr(event, "message_str", "") or "")
+        text = re.sub(r"^\s*/\S+\s*", "", text, count=1)
+        text = _AT_MARKUP_RE.sub(" ", text)
+        text = _AT_TEXT_RE.sub(" ", text)
+        return bool(text.strip())
 
     @staticmethod
     def _payload(event: AstrMessageEvent) -> str:

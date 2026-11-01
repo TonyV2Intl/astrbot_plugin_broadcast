@@ -398,6 +398,19 @@
         margin-bottom: 12px;
       }
 
+      .toggle-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .toggle-row .hint {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
       .toolbar .grow {
         flex: 1 1 200px;
         min-width: 160px;
@@ -487,6 +500,12 @@
         margin-bottom: 12px;
         background: var(--bg);
         color: var(--muted);
+      }
+
+      /* 混排 <strong> 的提示条按普通文本流排版，避免 flex 拆行 */
+      #mode-banner,
+      #last-result {
+        display: block;
       }
 
       .banner strong {
@@ -829,10 +848,18 @@
         <section class="card">
           <h2>目标会话</h2>
           <p class="desc">
-            勾选要广播的会话；新发现的会话会自动勾选。取消勾选即不再向该会话广播。
+            勾选要广播的会话；取消勾选即不再向该会话广播。
           </p>
 
           <div id="mode-banner" class="banner"></div>
+
+          <div class="toggle-row">
+            <label class="switch">
+              <input type="checkbox" id="auto-select-new" />
+              <span>新会话自动勾选</span>
+            </label>
+            <span class="hint">关闭后，新发现的会话保持未勾选，需要手动选中才会广播</span>
+          </div>
 
           <div class="toolbar">
             <div class="grow">
