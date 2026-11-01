@@ -442,6 +442,13 @@
         cursor: not-allowed;
       }
 
+      .head-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
       .status-tabs {
         display: inline-flex;
         gap: 4px;
@@ -717,6 +724,13 @@
           align-self: stretch;
           text-align: center;
         }
+        .head-actions {
+          width: 100%;
+          flex-wrap: nowrap;
+        }
+        .head-actions .btn {
+          flex: 1 1 0;
+        }
       }
 
       @media (max-width: 480px) {
@@ -815,7 +829,17 @@
                 AstrBot。
               </p>
             </div>
-            <button type="button" class="btn" id="add-schedule">新建任务</button>
+            <div class="head-actions">
+              <button
+                type="button"
+                class="btn"
+                id="clear-finished"
+                title="移除已执行完成的一次性任务"
+              >
+                清理已执行
+              </button>
+              <button type="button" class="btn" id="add-schedule">新建任务</button>
+            </div>
           </div>
           <div class="schedule-list" id="schedule-list"></div>
           <div class="empty hidden" id="schedule-empty">

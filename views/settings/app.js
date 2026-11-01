@@ -461,13 +461,39 @@ function buildTaskCard(task) {
   return card;
 }
 
+/** 一次性任务跑完会自动停用并记下执行时间，这类任务可以一键清理。 */
+function isFinished(task) {
+  return task.mode === "once" && task.enabled === false && Boolean(task.last_fired);
+}
+
 function renderSchedules() {
   const list = $("schedule-list");
   list.innerHTML = "";
   state.schedules.forEach((task) => list.appendChild(buildTaskCard(task)));
   $("schedule-empty").classList.toggle("hidden", state.schedules.length > 0);
   $("add-schedule").disabled = state.schedules.length >= MAX_SCHEDULES;
+
+  const finished = state.schedules.filter(isFinished).length;
+  const clearBtn = $("clear-finished");
+  clearBtn.disabled = finished === 0;
+  clearBtn.textContent = finished ? `清理已执行 (${finished})` : "清理已执行";
+  clearBtn.title = finished
+    ? `移除 ${finished} 个已执行完成的一次性任务`
+    : "没有已执行完成的一次性任务";
+
   updateSaveSummary();
+}
+
+function clearFinished() {
+  const before = state.schedules.length;
+  state.schedules = state.schedules.filter((task) => !isFinished(task));
+  const removed = before - state.schedules.length;
+  if (!removed) {
+    toast("没有已执行完成的任务可清理", true);
+    return;
+  }
+  renderSchedules();
+  toast(`已移除 ${removed} 个已执行任务，保存后生效`);
 }
 
 function addSchedule() {
@@ -837,6 +863,7 @@ function bindEvents() {
   $("save").addEventListener("click", save);
   $("refresh-sessions").addEventListener("click", refreshSessions);
   $("add-schedule").addEventListener("click", addSchedule);
+  $("clear-finished").addEventListener("click", clearFinished);
 
   $("auto-register").addEventListener("change", () => {
     $("auto-register-label").textContent = $("auto-register").checked ? "开启" : "关闭";
