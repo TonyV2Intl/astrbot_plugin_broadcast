@@ -52,7 +52,6 @@ astrbot_plugin_broadcast/
 - 每分钟最多发送条数（0 = 不限，QQ 官方建议 20）
 - 每日额度上限（0 = 不限，QQ 官方主动消息约 1000 条/天）
 - 时区（定时任务按此时区计算）
-- 自动登记会话
 
 **定时广播**
 
@@ -90,11 +89,12 @@ astrbot_plugin_broadcast/
 
 ## 会话是怎么发现的
 
-QQ 官方开放平台**没有**「查询机器人已加入的全部群」的接口（只有单群查询），所以插件用三路合并：
+QQ 官方开放平台**没有**「查询机器人已加入的全部群」的接口（只有单群查询），所以插件用两路合并：
 
-1. **自动登记**：机器人收到任意消息时记录该会话的 UMO（写入 `sessions.json`）；
-2. **适配器缓存**：读取平台实例内存中的 `_session_scene`（QQ 官方适配器用它区分 group / friend）；
-3. **数据库**：查询 `conversations`、`umo_senders`、`umo_aliases` 三张表中的已知 UMO，与 WebUI 会话列表同源。
+1. **适配器缓存**：读取平台实例内存中的 `_session_scene`（QQ 官方适配器用它区分 group / friend）；
+2. **数据库**：查询 `conversations`、`umo_senders`、`umo_aliases` 三张表中的已知 UMO 与别名，与 WebUI 会话列表同源。
+
+插件自己不维护会话表。会话名由 AstrBot 主程序在收到消息时写入 `umo_aliases`，插件只读不写，少一份数据也就少一处不一致。
 
 如果挂了 **aiocqhttp**（NapCat / Lagrange），点「刷新会话列表」会额外调用 `get_group_list` 与 `get_friend_list`，一次性补全群和好友。这是唯一能主动枚举会话的通道，对 Telegram / Discord 等平台不适用（它们的 Bot API 本身不提供该能力）。
 
@@ -137,10 +137,11 @@ QQ 官方适配器在缺少 `msg_id` 时，只有 `_session_scene` 记录为 `gr
 | 文件 | 内容 |
 | --- | --- |
 | `settings.json` | 页面保存的全部配置 |
-| `sessions.json` | 自动登记的会话（UMO → 名称、最后活跃时间） |
 | `state.json` | 当日已发数量、上次广播结果 |
 
 写入使用临时文件 + `os.replace` 原子替换；文件损坏时自动备份为 `*.broken.<时间戳>` 并回退默认值。
+
+早期版本的 `sessions.json` 已不再使用，升级后可以直接删掉。
 
 ## 常见问题
 

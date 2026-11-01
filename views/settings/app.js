@@ -690,8 +690,6 @@ function renderAll() {
   $("max-per-minute").value = settings.max_per_minute ?? 20;
   $("daily-limit").value = settings.daily_limit ?? 1000;
   $("timezone").value = settings.timezone || "Asia/Shanghai";
-  $("auto-register").checked = settings.auto_register !== false;
-  $("auto-register-label").textContent = settings.auto_register === false ? "关闭" : "开启";
 
   renderFilters();
   renderSchedules();
@@ -785,7 +783,6 @@ function collectForm() {
       last_fired: task.last_fired || "",
     })),
     timezone: $("timezone").value.trim() || "Asia/Shanghai",
-    auto_register: $("auto-register").checked,
   };
 }
 
@@ -864,10 +861,6 @@ function bindEvents() {
   $("refresh-sessions").addEventListener("click", refreshSessions);
   $("add-schedule").addEventListener("click", addSchedule);
   $("clear-finished").addEventListener("click", clearFinished);
-
-  $("auto-register").addEventListener("change", () => {
-    $("auto-register-label").textContent = $("auto-register").checked ? "开启" : "关闭";
-  });
 
   $("search").addEventListener("input", () => {
     state.filters.q = $("search").value;

@@ -83,7 +83,6 @@ MAX_SCHEDULES = 20
 #: 广播进行中到点的定时任务最多排这么多，避免极端情况下无限堆积。
 #: 任务总数上限是 20，同一天里每个任务最多排一次，32 足够宽裕。
 MAX_PENDING = 32
-REGISTRY_FLUSH_DELAY = 5.0
 DB_UMO_LIMIT = 5000
 
 #: 这些平台不是真正的 IM 会话，广播时应忽略。
@@ -254,7 +253,6 @@ class Settings:
     daily_limit: int = DEFAULT_DAILY_LIMIT
     schedules: list[ScheduleTask] = field(default_factory=list)
     timezone: str = DEFAULT_TIMEZONE
-    auto_register: bool = True
 
     # -- 序列化 ---------------------------------------------------------- #
     def to_dict(self) -> dict[str, Any]:
@@ -267,7 +265,6 @@ class Settings:
             "daily_limit": self.daily_limit,
             "schedules": [task.to_dict() for task in self.schedules],
             "timezone": self.timezone,
-            "auto_register": self.auto_register,
         }
 
     @classmethod
@@ -313,7 +310,6 @@ class Settings:
             daily_limit=daily_limit,
             schedules=_parse_schedules(raw.get("schedules"), base.schedules),
             timezone=timezone,
-            auto_register=bool(raw.get("auto_register", base.auto_register)),
         )
 
     def replace(self, **kwargs: Any) -> Settings:
@@ -479,24 +475,20 @@ class OfficialBroadcastPlugin(Star):
         super().__init__(context, config)
         self._data_dir = self._resolve_data_dir()
         self._settings_path = self._data_dir / "settings.json"
-        self._registry_path = self._data_dir / "sessions.json"
         self._state_path = self._data_dir / "state.json"
 
         self._settings = Settings()
-        self._registry: dict[str, dict[str, Any]] = {}
         self._state: dict[str, Any] = {"date": "", "sent": 0, "last_result": None}
         self._busy = False
         self._idle: asyncio.Event | None = None
         self._pending: deque[str] = deque()
         self._drain_task: asyncio.Task | None = None
         self._task: asyncio.Task | None = None
-        self._flush_task: asyncio.Task | None = None
         self._scheduler: Any = None
         self._schedule_error = ""
         self._task_errors: dict[str, str] = {}
 
         self._load_settings()
-        self._load_registry()
         self._load_state()
         self._register_web_apis()
 
@@ -585,66 +577,6 @@ class OfficialBroadcastPlugin(Star):
         self._atomic_write(self._settings_path, self._settings.to_dict())
 
     # ------------------------------------------------------------------ #
-    # 会话登记表
-    # ------------------------------------------------------------------ #
-    def _load_registry(self) -> None:
-        path = self._registry_path
-        if not path.exists():
-            return
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            self._backup_broken(path)
-            return
-        if not isinstance(raw, dict):
-            return
-        for umo, item in raw.items():
-            if not isinstance(umo, str) or not _UMO_RE.match(umo):
-                continue
-            record = item if isinstance(item, dict) else {}
-            self._registry[umo] = {
-                "name": str(record.get("name") or ""),
-                "last_seen": float(record.get("last_seen") or 0.0),
-            }
-        logger.info(f"[broadcast] 已加载 {len(self._registry)} 条会话记录")
-
-    def _save_registry(self) -> None:
-        try:
-            self._atomic_write(self._registry_path, self._registry)
-        except Exception:
-            logger.warning("[broadcast] 写入会话登记表失败", exc_info=True)
-
-    def _record_session(self, umo: str, name: str = "") -> bool:
-        if not _UMO_RE.match(umo or ""):
-            return False
-        record = self._registry.setdefault(umo, {"name": "", "last_seen": 0.0})
-        changed = False
-        if name and record.get("name") != name:
-            record["name"] = name
-            changed = True
-        now = time.time()
-        if now - float(record.get("last_seen") or 0) > 60:
-            record["last_seen"] = now
-            changed = True
-        return changed
-
-    def _schedule_flush(self) -> None:
-        """合并短时间内的多次登记，避免每条消息都写盘。"""
-        if self._flush_task and not self._flush_task.done():
-            return
-        loop = asyncio.get_event_loop()
-        self._flush_task = loop.create_task(self._flush_later())
-
-    async def _flush_later(self) -> None:
-        try:
-            await asyncio.sleep(REGISTRY_FLUSH_DELAY)
-            self._save_registry()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning("[broadcast] 延迟写入会话表失败", exc_info=True)
-
-    # ------------------------------------------------------------------ #
     # 运行状态
     # ------------------------------------------------------------------ #
     def _load_state(self) -> None:
@@ -711,9 +643,6 @@ class OfficialBroadcastPlugin(Star):
                 item.display_name = name
             if source and source not in item.sources:
                 item.sources.append(source)
-
-        for umo, record in self._registry.items():
-            add(umo, str(record.get("name") or ""), "registry")
 
         for session in self._adapter_sessions():
             add(session["umo"], session.get("name", ""), "adapter")
@@ -876,9 +805,6 @@ class OfficialBroadcastPlugin(Star):
                     name = str(row.get("group_name") or row.get("nickname") or "")
                     umo = f"{platform_id}:{message_type}:{sid}"
                     collected.append({"umo": umo, "name": name})
-                    self._record_session(umo, name)
-        if collected:
-            self._save_registry()
         return collected
 
     # ------------------------------------------------------------------ #
@@ -1554,17 +1480,6 @@ class OfficialBroadcastPlugin(Star):
             + f"\n会话数：{len(await self._collect_sessions())}"
         )
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
-    async def record_session(self, event: AstrMessageEvent):
-        """收到任意消息时登记会话，便于后续广播。"""
-        if not self._settings.auto_register:
-            return
-        umo = str(getattr(event, "unified_msg_origin", "") or "")
-        if not umo:
-            return
-        if self._record_session(umo, self._session_name(event)):
-            self._schedule_flush()
-
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
@@ -1586,21 +1501,6 @@ class OfficialBroadcastPlugin(Star):
             return False
 
     @staticmethod
-    def _session_name(event: AstrMessageEvent) -> str:
-        message_obj = getattr(event, "message_obj", None)
-        group = getattr(message_obj, "group", None)
-        name = str(getattr(group, "group_name", "") or "") if group else ""
-        if name:
-            return name
-        getter = getattr(event, "get_sender_name", None)
-        if callable(getter):
-            try:
-                return str(getter() or "")
-            except Exception:
-                return ""
-        return ""
-
-    @staticmethod
     def _payload(event: AstrMessageEvent) -> str:
         text = str(getattr(event, "message_str", "") or "")
         return re.sub(r"^\s*/\S+\s*", "", text, count=1, flags=re.DOTALL).strip()
@@ -1610,12 +1510,11 @@ class OfficialBroadcastPlugin(Star):
         if not sessions:
             return (
                 "⚠️ 还没有发现任何会话，广播无法发送。\n\n"
-                "插件会从三个来源发现会话：\n"
-                "1. 机器人收到过消息的会话会被自动登记；\n"
-                "2. 平台适配器内存中的会话缓存；\n"
-                "3. AstrBot 数据库中的已知会话。\n\n"
+                "插件会从这些来源发现会话：\n"
+                "1. 平台适配器内存中的会话缓存；\n"
+                "2. AstrBot 数据库中的已知会话（与 WebUI 会话列表同源）。\n\n"
                 "如果仍然为空：\n"
-                "· 让机器人在目标群/私聊里各收一条消息；\n"
+                "· 在目标群/私聊里和机器人说一句话，AstrBot 会自动记下会话名；\n"
                 "· 或挂载 aiocqhttp 后在插件配置页点「刷新会话」；\n"
                 "· 或在配置页把完整 UMO 手动加入白名单。"
             )
@@ -1649,10 +1548,9 @@ class OfficialBroadcastPlugin(Star):
     async def terminate(self):
         """插件卸载/重载时清理定时器与后台任务。"""
         self._shutdown_scheduler()
-        for task in (self._task, self._flush_task, self._drain_task):
+        for task in (self._task, self._drain_task):
             if task and not task.done():
                 task.cancel()
-        self._save_registry()
         self._save_state()
 
 
