@@ -1,8 +1,0 @@
-{
-  "enabled": {
-    "description": "启用广播插件",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后 /broadcast 指令与定时广播都会停止。其余配置（管理员、目标会话、定时任务等）请打开插件详情页中的「广播配置」视图填写。"
-  }
-}

@@ -371,6 +371,8 @@ function buildTaskCard(task) {
     if (runtime.error) {
       text = runtime.error;
       warn = true;
+    } else if (runtime.pending) {
+      text = "已到点，排队等待当前广播结束后立即发送";
     } else if (task.enabled === false) {
       text = task.last_fired
         ? `已于 ${formatDateTime(task.last_fired)} 执行完成`
@@ -657,8 +659,6 @@ function renderLastResult() {
 
 function renderAll() {
   const settings = state.settings || {};
-  $("enabled").checked = Boolean(state.overview?.enabled);
-  $("enabled-label").textContent = state.overview?.enabled ? "已启用" : "已禁用";
   $("admin-uids").value = (settings.admin_uids || []).join(", ");
   $("send-interval").value = settings.send_interval ?? 2;
   $("max-per-minute").value = settings.max_per_minute ?? 20;
@@ -742,7 +742,6 @@ function toggleExclude(umo) {
 function collectForm() {
   const settings = state.settings || {};
   return {
-    enabled: $("enabled").checked,
     admin_uids: splitList($("admin-uids").value),
     target_umos: settings.target_umos || [],
     exclude_umos: settings.exclude_umos || [],
@@ -839,9 +838,6 @@ function bindEvents() {
   $("refresh-sessions").addEventListener("click", refreshSessions);
   $("add-schedule").addEventListener("click", addSchedule);
 
-  $("enabled").addEventListener("change", () => {
-    $("enabled-label").textContent = $("enabled").checked ? "已启用" : "已禁用";
-  });
   $("auto-register").addEventListener("change", () => {
     $("auto-register-label").textContent = $("auto-register").checked ? "开启" : "关闭";
   });

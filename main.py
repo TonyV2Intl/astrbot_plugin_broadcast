@@ -1,10 +1,9 @@
 """AstrBot 全群广播插件（独立可视化配置台版）。
 
 架构说明：
-    v2 起配置不再堆在 ``_conf_schema.json`` 里，而是由插件自带的
-    可视化视图（``views/settings/``）管理，数据落在
-    ``data/plugin_data/astrbot_plugin_broadcast/settings.json``。
-    ``_conf_schema.json`` 只保留一个全局启用开关。
+    插件没有 ``_conf_schema.json``：启停由 AstrBot 插件管理统一负责，
+    其余配置全部由自带的可视化视图（``views/settings/``）管理，
+    数据落在 ``data/plugin_data/astrbot_plugin_broadcast/settings.json``。
 
     视图通过 ``window.AstrBotPluginView`` bridge 调用下列后端接口，
     接口一律用 ``astrbot.api.web`` 的 ``request`` / ``json_response`` /
@@ -37,7 +36,7 @@ import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -81,6 +80,9 @@ DEFAULT_TIME = "09:00"
 MAX_INTERVAL = 60.0
 MAX_MESSAGE_LENGTH = 4000
 MAX_SCHEDULES = 20
+#: 广播进行中到点的定时任务最多排这么多，避免极端情况下无限堆积。
+#: 任务总数上限是 20，同一天里每个任务最多排一次，32 足够宽裕。
+MAX_PENDING = 32
 REGISTRY_FLUSH_DELAY = 5.0
 DB_UMO_LIMIT = 5000
 
@@ -475,7 +477,6 @@ class RateLimiter:
 class OfficialBroadcastPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context, config)
-        self.config = config or {}
         self._data_dir = self._resolve_data_dir()
         self._settings_path = self._data_dir / "settings.json"
         self._registry_path = self._data_dir / "sessions.json"
@@ -485,6 +486,9 @@ class OfficialBroadcastPlugin(Star):
         self._registry: dict[str, dict[str, Any]] = {}
         self._state: dict[str, Any] = {"date": "", "sent": 0, "last_result": None}
         self._busy = False
+        self._idle: asyncio.Event | None = None
+        self._pending: deque[str] = deque()
+        self._drain_task: asyncio.Task | None = None
         self._task: asyncio.Task | None = None
         self._flush_task: asyncio.Task | None = None
         self._scheduler: Any = None
@@ -524,12 +528,6 @@ class OfficialBroadcastPlugin(Star):
 
     def _today(self) -> str:
         return datetime.now(self._tz()).strftime("%Y-%m-%d")
-
-    def _config_enabled(self) -> bool:
-        try:
-            return bool(self.config.get("enabled", True))
-        except Exception:
-            return True
 
     @staticmethod
     def _atomic_write(path: Path, payload: Any) -> None:
@@ -585,18 +583,6 @@ class OfficialBroadcastPlugin(Star):
 
     def _save_settings(self) -> None:
         self._atomic_write(self._settings_path, self._settings.to_dict())
-
-    def _set_enabled(self, value: bool) -> None:
-        try:
-            self.config["enabled"] = bool(value)
-        except Exception:
-            return
-        save = getattr(self.config, "save_config", None)
-        if callable(save):
-            try:
-                save()
-            except Exception:
-                logger.warning("[broadcast] 写入插件总开关失败", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # 会话登记表
@@ -971,10 +957,9 @@ class OfficialBroadcastPlugin(Star):
         message = (message or "").strip()
         if not message:
             return BroadcastResult(source=source)
-        if not self._config_enabled():
-            return BroadcastResult(source=source)
 
         self._busy = True
+        self._idle_event().clear()
         started = time.monotonic()
         result = BroadcastResult(source=source)
         try:
@@ -1028,6 +1013,8 @@ class OfficialBroadcastPlugin(Star):
             return result
         finally:
             self._busy = False
+            self._idle_event().set()
+            self._kick_pending()
 
     # ------------------------------------------------------------------ #
     # 定时任务
@@ -1066,6 +1053,7 @@ class OfficialBroadcastPlugin(Star):
     def _reschedule(self) -> tuple[bool, str]:
         """清掉旧任务，按最新配置为每个任务注册独立 job。"""
         self._shutdown_scheduler()
+        self._pending.clear()
         self._schedule_error = ""
         self._task_errors = {}
         tasks = self._settings.schedules
@@ -1075,9 +1063,6 @@ class OfficialBroadcastPlugin(Star):
             return False, "尚未添加定时任务"
         if not enabled:
             return False, "所有定时任务都已停用"
-        if not self._config_enabled():
-            self._schedule_error = "插件总开关已关闭"
-            return False, self._schedule_error
         if not SCHEDULER_AVAILABLE:
             self._schedule_error = "未安装 apscheduler，无法注册定时任务"
             return False, self._schedule_error
@@ -1141,17 +1126,84 @@ class OfficialBroadcastPlugin(Star):
             return
 
         if self._busy:
-            logger.warning(f"[broadcast] 上一次广播未结束，任务 {task_id} 稍后重试")
-            if task.mode == "once":
-                self._retry_once_later(task)
+            self._queue_task(task)
             return
 
-        logger.info(f"[broadcast] 定时任务 {task_id} 开始（{task.describe()}）")
+        await self._execute_task(task)
+
+    async def _execute_task(self, task: ScheduleTask) -> None:
+        """真正执行一条定时任务；一次性任务无论成败都在之后停用。"""
+        logger.info(f"[broadcast] 定时任务 {task.id} 开始（{task.describe()}）")
+        error = ""
         try:
-            await self.do_broadcast(task.message.strip(), source="schedule")
-            self._task_errors.pop(task_id, None)
-        finally:
-            self._finish_once_task(task, fired=True)
+            result = await self.do_broadcast(task.message.strip(), source="schedule")
+            if result is None:
+                # 极端情况：刚被别的广播抢占，重新排队，等它跑完立刻补发
+                self._queue_task(task)
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = f"执行失败：{exc}"
+            logger.exception(f"[broadcast] 定时任务 {task.id} 执行失败")
+
+        if error:
+            self._task_errors[task.id] = error
+        else:
+            self._task_errors.pop(task.id, None)
+        self._finish_once_task(task, fired=not error)
+
+    def _idle_event(self) -> asyncio.Event:
+        """当前广播结束的信号；懒创建，避免在无事件循环时构造。"""
+        if self._idle is None:
+            self._idle = asyncio.Event()
+            self._idle.set()
+        return self._idle
+
+    def _queue_task(self, task: ScheduleTask) -> None:
+        """广播进行中到点的任务先排进队列，等当前广播结束立刻补发。"""
+        if task.id in self._pending:
+            return
+        if len(self._pending) >= MAX_PENDING:
+            self._task_errors[task.id] = "等待队列已满，本次未发送"
+            logger.warning(f"[broadcast] 等待队列已满，任务 {task.id} 被丢弃")
+            return
+        self._pending.append(task.id)
+        logger.info(f"[broadcast] 任务 {task.id} 到点时正在广播，已排队等待补发")
+        self._kick_pending()
+
+    def _kick_pending(self) -> None:
+        """确保有且只有一个 drain 循环在等待空闲。"""
+        if not self._pending:
+            return
+        current = self._drain_task
+        if current is not None and not current.done():
+            return
+        try:
+            self._drain_task = asyncio.create_task(self._drain_pending())
+        except RuntimeError:  # pragma: no cover - 无事件循环
+            logger.debug("[broadcast] 没有事件循环，排队任务暂不处理")
+
+    async def _drain_pending(self) -> None:
+        """当前广播一结束，就按到点先后把排队的任务依次补发。"""
+        try:
+            while self._pending:
+                task_id = self._pending[0]
+                task = next(
+                    (t for t in self._settings.schedules if t.id == task_id), None
+                )
+                if task is None or not task.enabled or not task.message.strip():
+                    self._pending.popleft()
+                    continue
+                if self._busy:
+                    await self._idle_event().wait()
+                    continue
+                self._pending.popleft()
+                await self._execute_task(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[broadcast] 处理排队任务失败")
 
     def _finish_once_task(self, task: ScheduleTask, *, fired: bool) -> None:
         """一次性任务跑完后自动停用，像闹钟响过就不再响。"""
@@ -1164,26 +1216,6 @@ class OfficialBroadcastPlugin(Star):
             self._save_settings()
         except Exception:
             logger.exception("[broadcast] 停用一次性任务失败")
-
-    def _retry_once_later(self, task: ScheduleTask, delay: int = 300) -> None:
-        """一次性任务撞上正在进行的广播时，延迟重试而不是直接丢掉。"""
-        if self._scheduler is None:
-            return
-        try:
-            self._scheduler.add_job(
-                self._run_scheduled_task,
-                DateTrigger(
-                    run_date=datetime.now(self._tz()) + timedelta(seconds=delay)
-                ),
-                args=[task.id],
-                id=f"{task.job_id}_retry{int(time.time())}",
-                replace_existing=True,
-                coalesce=True,
-                max_instances=1,
-            )
-            logger.info(f"[broadcast] 任务 {task.id} 将在 {delay} 秒后重试")
-        except Exception:
-            logger.exception("[broadcast] 安排重试失败")
 
     def _task_next_run(self, task_id: str) -> str:
         if self._scheduler is None:
@@ -1203,6 +1235,7 @@ class OfficialBroadcastPlugin(Star):
                 {
                     "id": task.id,
                     "next_run_at": self._task_next_run(task.id),
+                    "pending": task.id in self._pending,
                     "error": self._task_errors.get(task.id, ""),
                 }
             )
@@ -1255,7 +1288,6 @@ class OfficialBroadcastPlugin(Star):
     def _overview(self) -> dict[str, Any]:
         used = self._quota_used()
         return {
-            "enabled": self._config_enabled(),
             "today_sent": used,
             "daily_limit": self._settings.daily_limit,
             "quota_left": (
@@ -1324,9 +1356,6 @@ class OfficialBroadcastPlugin(Star):
             logger.exception("[broadcast] 保存配置失败")
             return error_response(f"写入配置文件失败：{exc}", status_code=500)
 
-        if "enabled" in payload:
-            self._set_enabled(bool(payload.get("enabled")))
-
         ok, message = self._reschedule()
         if not ok and settings.schedules:
             logger.warning(f"[broadcast] 定时任务未生效：{message}")
@@ -1362,9 +1391,6 @@ class OfficialBroadcastPlugin(Star):
     @filter.command("broadcast")
     async def broadcast(self, event: AstrMessageEvent):
         """向目标会话广播一条消息。"""
-        if not self._config_enabled():
-            yield event.plain_result("⚠️ 广播插件已在配置中禁用。")
-            return
         if not self._is_admin(event):
             yield event.plain_result(
                 "⚠️ 权限不足：仅管理员可使用广播指令。\n"
@@ -1454,7 +1480,6 @@ class OfficialBroadcastPlugin(Star):
         targets, missing = await self._resolve_targets(settings)
         lines = [
             "📊 广播运行状态",
-            f"插件开关：{'启用' if overview['enabled'] else '禁用'}",
             f"已知会话：{len(sessions)} 个｜本次目标：{len(targets)} 个",
             f"目标模式：{'白名单' if settings.target_umos else '全部会话'}",
             f"排除名单：{len(settings.exclude_umos)} 个",
@@ -1624,7 +1649,7 @@ class OfficialBroadcastPlugin(Star):
     async def terminate(self):
         """插件卸载/重载时清理定时器与后台任务。"""
         self._shutdown_scheduler()
-        for task in (self._task, self._flush_task):
+        for task in (self._task, self._flush_task, self._drain_task):
             if task and not task.done():
                 task.cancel()
         self._save_registry()

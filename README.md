@@ -2,7 +2,7 @@
 
 AstrBot 多会话广播插件。向机器人所在的群聊与私聊批量推送消息，支持独立可视化配置台、定时广播、目标白名单、排除名单、发送限速与每日额度保护。
 
-> **v2 重大变更**：配置不再堆在 AstrBot 的「插件配置」弹窗里，改为插件自带的可视化视图（`views/settings/`）。`_conf_schema.json` 只剩一个总开关。
+> **v2 重大变更**：插件不再提供 `_conf_schema.json`——启用与停用交给 AstrBot 插件管理，其余配置全部在自带的可视化视图（`views/settings/`）里完成。
 
 ## 环境要求
 
@@ -26,12 +26,13 @@ AstrBot 多会话广播插件。向机器人所在的群聊与私聊批量推送
 astrbot_plugin_broadcast/
 ├─ main.py                      # 插件入口与后端 Web API
 ├─ metadata.yaml                # 插件元数据
-├─ _conf_schema.json            # 仅保留 enabled 总开关
 ├─ requirements.txt
 ├─ logo.png
 ├─ LICENSE
 ├─ .astrbot-plugin/
-│  └─ i18n/zh-CN.json           # 插件名、配置项与视图标题的翻译
+│  └─ i18n/                     # 插件名与视图标题的中英文翻译
+│     ├─ zh-CN.json
+│     └─ en-US.json
 └─ views/
    └─ settings/
       ├─ index.html             # 视图入口（必须有 index.html）
@@ -62,7 +63,7 @@ astrbot_plugin_broadcast/
   - **仅一次**：选日期 + 时间，到点执行一次后自动停用，像手机闹钟
 - 每条任务可单独启用/停用、单独删除，卡片上直接显示「下次触发」时间
 - 保存后立即销毁旧调度并按新配置重新注册，**无需重启 AstrBot**
-- 一次性任务若因上一次广播尚未结束而错过，会顺延 5 分钟后重试，不会被静默丢弃
+- 到点时若上一次广播还没结束，任务会**排队**，等当前广播一结束就立刻补发，不丢任务也不会并发推送
 - 计划时间已经过去的一次性任务不会注册，卡片上会标黄提示
 
 **目标会话**
@@ -81,7 +82,7 @@ astrbot_plugin_broadcast/
 | 指令 | 说明 |
 | --- | --- |
 | `/broadcast <消息>` | 向当前目标广播；先回执目标数与预计耗时，完成后回执成功/失败/失败明细 |
-| `/broadcast_status` | 查看开关、会话数、目标数、额度、定时任务列表与各自的下次触发 |
+| `/broadcast_status` | 查看会话数、目标数、额度、定时任务列表与各自的下次触发 |
 | `/broadcast_list` | 列出已发现的会话（✅ 已选 / ⬜ 未选 / 🚫 已排除） |
 | `/broadcast_reload` | 重新读取 `settings.json` 并重建定时任务 |
 
