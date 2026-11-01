@@ -159,6 +159,15 @@
         font-size: 12px;
       }
 
+      .field .hint code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11.5px;
+        padding: 1px 4px;
+        border-radius: 4px;
+        background: var(--bg);
+        border: 1px solid var(--border);
+      }
+
       input[type="text"],
       input[type="number"],
       input[type="time"],
@@ -791,8 +800,10 @@
               <label for="admin-uids">管理员 UID</label>
               <input type="text" id="admin-uids" placeholder="多个用逗号分隔" />
               <span class="hint"
-                >留空时回退到 AstrBot 全局管理员。QQ 官方机器人在群里的 UID
-                是 member_openid，不是 QQ 号。</span
+                >留空回退到 AstrBot 全局管理员。也可用
+                <code>/broadcast_auth &lt;UID&gt;</code> 添加。QQ 官方群里是
+                member_openid 而非 QQ 号：让对方发条消息，日志里「昵称/UID」
+                的后半段即是。</span
               >
             </div>
             <div class="field">

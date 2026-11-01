@@ -47,7 +47,7 @@ astrbot_plugin_broadcast/
 
 **基础设置**
 
-- 管理员 UID（逗号分隔，留空回退到 AstrBot 全局管理员；也可在群里用 `/broadcast_auth` 直接授权）
+- 管理员 UID（逗号分隔，留空回退到 AstrBot 全局管理员；也可在群里用 `/broadcast_auth <UID>` 直接授权）
 - 每个会话发送间隔（默认 2 秒）
 - 每分钟最多发送条数（0 = 不限，QQ 官方建议 20）
 - 每日额度上限（0 = 不限，QQ 官方主动消息约 1000 条/天）
@@ -102,24 +102,30 @@ AstrBot 开启「对话隔离」（配置项 `platform_settings.unique_session`�
 | `/broadcast_status` | 查看会话数、目标数、额度、定时任务列表与各自的下次触发 |
 | `/broadcast_list` | 列出已发现的会话（✅ 已勾选 / ⬜ 未勾选） |
 | `/broadcast_reload` | 重新读取 `settings.json` 并重建定时任务 |
-| `/broadcast_auth @某人` | 把被 @ 的用户添加为广播管理员（仅广播管理员或 AstrBot 超级管理员可用） |
+| `/broadcast_auth <UID>` | 把指定 UID 添加为广播管理员（仅广播管理员或 AstrBot 超级管理员可用） |
 
 `/broadcast_add`、`/broadcast_remove` 在 v2 中移除，目标管理统一由配置页完成。
 
 ### 用 `/broadcast_auth` 授权管理员
 
-群里 @ 一下就能加人，不用回后台手填 UID。只有**当前已在 `admin_uids` 里的人**或 **AstrBot 超级管理员**能执行；成功后立即写回 `settings.json`，配置页刷新即可看到。
+在群里直接填 UID 就能加人，不用回后台手填。只有**当前已在 `admin_uids` 里的人**或 **AstrBot 超级管理员**能执行；成功后立即写回 `settings.json`，配置页刷新即可看到。
 
 ```text
-/broadcast_auth @张三
-✅ 已成功将 @张三 添加为广播管理员
+/broadcast_auth 123456789
+✅ 已成功将 123456789 添加为广播管理员
 当前管理员共 2 个
+
+/broadcast_auth 123456789
+ℹ️ 123456789：该用户已经是管理员了
 ```
 
-- 指令后除了 @ 不能带别的文字，否则回「用法：/broadcast_auth @某人」
-- 一次 @ 多个人会逐个授权，已经在名单里的返回「该用户已经是管理员了」
-- `@全体成员` 和 @ 机器人自己会被忽略
-- 被 @ 用户的 UID 按平台解析：消息链的 `At` 段 → QQ 官方的 `raw_message.mentions` → 文本里的 `<qqbot-at-user id="..."/>` 标记，三者取其一
+- 支持一次授权多个：`/broadcast_auth 123456789 987654321`（空格、逗号、分号、顿号都可以分隔），重复的 UID 会自动去重
+- UID 不合法会整条拒绝并列出哪几项有问题，不会只写进去一半
+- 写成 `@昵称` 会提示「请填写 UID，不要 @ 昵称」
+
+**为什么不支持 @**：QQ 官方开放平台只把「@ 机器人自己」放进消息链，@ 其他人的信息不会下发给机器人；即使有 `raw_message.mentions`，也拿不到稳定的可持久化标识。aiocqhttp 虽然能拿到，但为了两个平台行为一致，统一改成填 UID。
+
+**怎么拿到 UID**：让目标用户在群里随便发一句话，AstrBot 日志会打印 `[配置名] [平台] 昵称/UID: 消息内容`，后半段那串就是。也可以从配置页「管理员 UID」输入框手动填，效果一样。
 
 > QQ 官方平台的用户 ID 是 openid，**作用域是机器人应用（AppID），不是群**：
 >

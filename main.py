@@ -14,7 +14,7 @@
     /broadcast_status       查看运行状态
     /broadcast_list         查看已发现的会话
     /broadcast_reload       重载配置并重建定时任务
-    /broadcast_auth @某人   把被 @ 的用户添加为广播管理员（管理员/超管）
+    /broadcast_auth <UID>   把指定 UID 添加为广播管理员（管理员/超管）
 
 说明：
     广播目标不再局限于群聊。插件会综合三处来源发现会话：
@@ -96,13 +96,19 @@ _UMO_RE = re.compile(r"^[^:\s]+:[^:\s]+:.+$")
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# 管理员 UID：QQ 号为纯数字，QQ 官方 openid 为大小写字母数字串，
+# 其余平台（Telegram/飞书等）多为数字或带分隔符的字符串。
+_ADMIN_UID_RE = re.compile(r"^[A-Za-z0-9_.:-]{4,80}$")
+# 参数分隔：空格、逗号、分号、顿号
+_ARG_SPLIT_RE = re.compile(r"[\s,，;；、]+")
 
-# 各平台在纯文本里遗留的 @ 标记：QQ 官方用 <qqbot-at-user id="..."> 或 <@openid>
-_AT_MARKUP_RE = re.compile(
-    r'<qqbot-at-user\s+id="(?P<a>[^"]+)"\s*/?>|<@!?(?P<b>[^>\s]+)>'
+AUTH_USAGE = (
+    "用法：/broadcast_auth <UID> [UID2 ...]\n"
+    "例：/broadcast_auth 123456789\n\n"
+    "UID 获取方式：让目标用户在群里发一条消息，"
+    "AstrBot 日志会打印「昵称/UID」，复制后半段即可。\n"
+    "也可以到插件配置页的「管理员 UID」里手动填写。"
 )
-# 文本形式的 @昵称 / @123456
-_AT_TEXT_RE = re.compile(r"[@＠]\S*")
 
 
 def _strip_command(text: str, command: str) -> str:
@@ -1561,50 +1567,55 @@ class OfficialBroadcastPlugin(Star):
 
     @filter.command("broadcast_auth")
     async def broadcast_auth(self, event: AstrMessageEvent):
-        """把被 @ 的用户添加为广播管理员。"""
+        """把指定 UID 添加为广播管理员。
+
+        QQ 官方等平台不会把「被 @ 的用户」下发给机器人（只有 @ 机器人
+        自己才会进入消息链），因此这里改为直接接收 UID 文本。
+        """
         if not self._can_grant_admin(event):
             yield event.plain_result(
                 "⚠️ 权限不足：仅广播管理员或 AstrBot 超级管理员可用。"
             )
             return
 
-        users = self._mentioned_users(event)
-        if not users:
-            self._log_mention_probe(event)
+        raw = _strip_command(getattr(event, "message_str", ""), "broadcast_auth")
+        tokens = [token for token in _ARG_SPLIT_RE.split(raw) if token]
+        if not tokens:
+            yield event.plain_result(AUTH_USAGE)
+            return
+
+        if any(token.startswith(("@", "＠")) for token in tokens):
             yield event.plain_result(
-                "用法：/broadcast_auth @某人\n（没有从这条消息里解析到被 @ 的用户）"
+                "⚠️ 请填写 UID，不要 @ 昵称。\n"
+                "机器人拿不到被 @ 用户的 ID，只能由你提供。\n\n" + AUTH_USAGE
             )
             return
-        if self._has_extra_text(event):
+
+        invalid = [token for token in tokens if not _ADMIN_UID_RE.match(token)]
+        if invalid:
             yield event.plain_result(
-                "用法：/broadcast_auth @某人\n（指令后不要带其他文字）"
+                f"⚠️ 这些不是合法的 UID：{'、'.join(invalid)}\n"
+                "UID 通常是一串数字（QQ 号）或字母数字组合（openid）。\n\n" + AUTH_USAGE
             )
             return
 
         admins = list(self._settings.admin_uids)
-        added: list[tuple[str, str]] = []
-        existed: list[tuple[str, str]] = []
-        for uid, name in users:
+        added: list[str] = []
+        existed: list[str] = []
+        for uid in dict.fromkeys(tokens):
             if uid in admins:
-                existed.append((uid, name))
+                existed.append(uid)
             else:
                 admins.append(uid)
-                added.append((uid, name))
+                added.append(uid)
 
         if added:
             self._settings.admin_uids = admins
             self._save_settings()
             logger.info(f"[broadcast] 新增 {len(added)} 个管理员")
 
-        def label(uid: str, name: str) -> str:
-            return f"@{name}" if name else f"@{uid}"
-
-        lines = [
-            f"✅ 已成功将 {label(uid, name)} 添加为广播管理员" for uid, name in added
-        ]
-        lines += [
-            f"ℹ️ {label(uid, name)}：该用户已经是管理员了" for uid, name in existed
-        ]
+        lines = [f"✅ 已成功将 {uid} 添加为广播管理员" for uid in added]
+        lines += [f"ℹ️ {uid}：该用户已经是管理员了" for uid in existed]
         if added:
             lines.append(f"当前管理员共 {len(self._settings.admin_uids)} 个")
         yield event.plain_result("\n".join(lines))
@@ -1639,137 +1650,6 @@ class OfficialBroadcastPlugin(Star):
     def _can_grant_admin(self, event: AstrMessageEvent) -> bool:
         """授权指令的门槛：已在广播管理员名单里，或 AstrBot 超级管理员。"""
         return self._is_admin(event) or self._is_super_admin(event)
-
-    @staticmethod
-    def _message_components(event: AstrMessageEvent) -> list[Any]:
-        getter = getattr(event, "get_messages", None)
-        if not callable(getter):
-            return []
-        try:
-            return list(getter() or [])
-        except Exception:
-            return []
-
-    @staticmethod
-    def _component_type(comp: Any) -> str:
-        if isinstance(comp, dict):
-            kind = comp.get("type", "")
-        else:
-            kind = getattr(comp, "type", "")
-        kind = getattr(kind, "value", kind)
-        return str(kind or "").lower()
-
-    def _raw_mentions(self, event: AstrMessageEvent) -> list[dict[str, str]]:
-        """QQ 官方等平台把非机器人 @ 放在 raw_message.mentions 里。"""
-        message_obj = getattr(event, "message_obj", None)
-        raw = getattr(message_obj, "raw_message", None)
-        mentions = getattr(raw, "mentions", None) or []
-        found: list[dict[str, str]] = []
-        for mention in mentions:
-            if isinstance(mention, dict):
-                if mention.get("is_you") is True:
-                    continue
-                uid = mention.get("id") or mention.get("member_openid") or ""
-                name = mention.get("username") or mention.get("member_name") or ""
-            else:
-                if getattr(mention, "is_you", False) is True:
-                    continue
-                uid = (
-                    getattr(mention, "id", None)
-                    or getattr(mention, "member_openid", None)
-                    or getattr(mention, "user_openid", None)
-                    or ""
-                )
-                name = getattr(mention, "username", "") or getattr(
-                    mention, "member_name", ""
-                )
-            if uid:
-                found.append({"id": str(uid), "name": str(name or "")})
-        return found
-
-    @staticmethod
-    def _raw_text(event: AstrMessageEvent) -> str:
-        message_obj = getattr(event, "message_obj", None)
-        raw = getattr(message_obj, "raw_message", None)
-        parts = [
-            str(getattr(event, "message_str", "") or ""),
-            str(getattr(message_obj, "message_str", "") or ""),
-            str(getattr(raw, "content", "") or ""),
-        ]
-        return "\n".join(part for part in parts if part)
-
-    def _mentioned_users(self, event: AstrMessageEvent) -> list[tuple[str, str]]:
-        """按「消息段 → raw.mentions → 文本标记」三路提取被 @ 的用户。"""
-        found: list[tuple[str, str]] = []
-
-        def add(uid: Any, name: Any = "") -> None:
-            value = str(uid or "").strip()
-            if not value or value.lower() in {"all", "everyone"}:
-                return
-            if any(value == item[0] for item in found):
-                return
-            found.append((value, str(name or "").strip()))
-
-        for comp in self._message_components(event):
-            if self._component_type(comp) != "at":
-                continue
-            if isinstance(comp, dict):
-                data = comp.get("data") or {}
-                add(data.get("qq"), data.get("name"))
-            else:
-                add(getattr(comp, "qq", ""), getattr(comp, "name", ""))
-
-        for mention in self._raw_mentions(event):
-            add(mention["id"], mention["name"])
-
-        for match in _AT_MARKUP_RE.finditer(self._raw_text(event)):
-            add(match.group("a") or match.group("b"))
-
-        self_id = ""
-        try:
-            self_id = str(event.get_self_id() or "").strip()
-        except Exception:
-            self_id = ""
-        return [(uid, name) for uid, name in found if uid != self_id]
-
-    def _log_mention_probe(self, event: AstrMessageEvent) -> None:
-        """记录一次 @ 解析诊断，便于定位不同平台的消息结构差异。"""
-        try:
-            message_obj = getattr(event, "message_obj", None)
-            raw = getattr(message_obj, "raw_message", None)
-            mentions = getattr(raw, "mentions", None)
-            chain_sample = []
-            for comp in self._message_components(event)[:8]:
-                if isinstance(comp, dict):
-                    chain_sample.append(comp)
-                else:
-                    chain_sample.append(
-                        {
-                            "type": self._component_type(comp),
-                            "qq": getattr(comp, "qq", ""),
-                            "name": getattr(comp, "name", ""),
-                        }
-                    )
-            get_name = getattr(event, "get_platform_name", None)
-            get_self = getattr(event, "get_self_id", None)
-            logger.info(
-                "[broadcast] @ 解析为空，诊断信息："
-                f"platform={get_name() if callable(get_name) else ''} "
-                f"self_id={get_self() if callable(get_self) else ''} "
-                f"message_str={str(getattr(event, 'message_str', ''))[:200]!r} "
-                f"chain={chain_sample!r} "
-                f"mentions={str(mentions)[:500]!r} "
-                f"raw_content={str(getattr(raw, 'content', ''))[:300]!r}"
-            )
-        except Exception:
-            logger.info("[broadcast] @ 解析为空，诊断信息采集失败", exc_info=True)
-
-    def _has_extra_text(self, event: AstrMessageEvent) -> bool:
-        """指令后除 @ 之外是否还有别的文字。"""
-        text = _strip_command(getattr(event, "message_str", ""), "broadcast_auth")
-        text = _AT_MARKUP_RE.sub(" ", text)
-        text = _AT_TEXT_RE.sub(" ", text)
-        return bool(text.strip())
 
     @staticmethod
     def _payload(event: AstrMessageEvent) -> str:
