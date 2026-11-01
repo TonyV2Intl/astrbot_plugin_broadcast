@@ -1,8 +1,7 @@
 name: astrbot_plugin_broadcast
 display_name: 全群广播
 desc: 向多个会话广播消息的 AstrBot 插件，带独立可视化配置台、定时任务、目标白名单与发送限速。
-short_desc: 全群广播 + 可视化配置台 + 定时发送
-version: 2.1.0
+version: 2.1.1
 author: TonyV2Intl
 repo: https://github.com/TonyV2Intl/astrbot_plugin_broadcast
 astrbot_version: ">=4.24.2,<5"

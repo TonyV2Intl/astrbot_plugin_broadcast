@@ -1,7 +1,6 @@
 {
   "metadata": {
     "display_name": "全群广播",
-    "short_desc": "全群广播 + 可视化配置台 + 定时发送",
     "desc": "向多个会话广播消息的 AstrBot 插件，带独立可视化配置台、定时任务、目标白名单与发送限速。"
   },
   "config": {
