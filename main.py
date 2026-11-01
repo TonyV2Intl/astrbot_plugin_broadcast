@@ -11,6 +11,7 @@
 
 指令：
     /broadcast <消息内容>   向目标会话广播（管理员）
+    /broadcast_test <消息>  向当前会话发送一条带［测试］标记的消息（管理员）
     /broadcast_status       查看运行状态
     /broadcast_list         查看已发现的会话
     /broadcast_reload       重载配置并重建定时任务
@@ -1550,6 +1551,58 @@ class OfficialBroadcastPlugin(Star):
         if len(sessions) > 40:
             lines.append(f"…… 其余 {len(sessions) - 40} 条请到插件配置页查看")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("broadcast_test")
+    async def broadcast_test(self, event: AstrMessageEvent):
+        """把当前会话当作唯一目标，发送一条带［测试］标记的消息。
+
+        只发一条、只发到当前会话：不消耗每日额度、不改动已勾选的目标、
+        不写入上次广播结果，纯粹用于在群里预览格式与可读性。
+        """
+        if not self._is_admin(event):
+            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
+            return
+
+        text = _strip_command(
+            getattr(event, "message_str", ""), "broadcast_test"
+        ).strip()
+        if not text:
+            yield event.plain_result(
+                "用法：/broadcast_test <消息内容>\n"
+                "会向当前会话发送一条带［测试］标记的消息，"
+                "不消耗额度、不影响正式广播目标。"
+            )
+            return
+
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        platform, message_type, session_id = _split_umo(umo)
+        if not _UMO_RE.match(umo):
+            yield event.plain_result("⚠️ 当前会话没有有效的 UMO，无法测试。")
+            return
+
+        count = len(dict.fromkeys(self._settings.target_umos))
+        session = SessionInfo(
+            umo=umo,
+            platform=platform,
+            message_type=message_type,
+            session_id=session_id,
+            display_name=session_id,
+        )
+        body = f"［测试］以下内容将发送到 {count} 个会话\n{text}"
+        ok, reason = await self._send_one(session, body)
+        if not ok:
+            yield event.plain_result(f"⚠️ 测试消息发送失败：{reason}")
+            return
+
+        if count:
+            yield event.plain_result(
+                f"✅ 测试消息已发送到当前会话（正式广播将发往 {count} 个会话）"
+            )
+        else:
+            yield event.plain_result(
+                "✅ 测试消息已发送到当前会话。\n"
+                "⚠️ 但当前一个会话都没勾选，正式广播不会发送。"
+            )
 
     @filter.command("broadcast_reload")
     async def broadcast_reload(self, event: AstrMessageEvent):
