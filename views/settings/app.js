@@ -13,11 +13,16 @@ const PLUGIN_ENDPOINT = {
   get: "config/get",
   save: "config/save",
   refresh: "config/refresh",
+  send: "broadcast/send",
+  job: "broadcast/job",
 };
 
 const WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const MAX_SCHEDULES = 20;
 const MAX_RENDER_ROWS = 400;
+/** 手动广播的二次确认有效期：超时未再点就取消。 */
+const ARM_TIMEOUT = 5000;
+const JOB_POLL_INTERVAL = 1200;
 
 const state = {
   bridge: null,
@@ -30,6 +35,17 @@ const state = {
   schedules: [],
   runtime: {},
   saving: false,
+  manual: {
+    mode: "follow",
+    q: "",
+    targets: new Set(),
+    job: null,
+    sending: false,
+    armed: false,
+    armTimer: null,
+    pollTimer: null,
+    watchingId: "",
+  },
 };
 
 /* ------------------------------------------------------------------ */
@@ -575,6 +591,40 @@ function filteredSessions() {
   });
 }
 
+function buildSessionRow(session, isSelected, onToggle) {
+  const row = document.createElement("div");
+  row.className = "session-row";
+  row.dataset.umo = session.umo;
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = isSelected;
+  checkbox.addEventListener("change", () => onToggle(checkbox.checked));
+
+  const main = document.createElement("div");
+  main.className = "main";
+  const name = document.createElement("div");
+  name.className = "name";
+  name.textContent = session.display_name || session.session_id;
+  const umo = document.createElement("span");
+  umo.className = "umo";
+  umo.textContent = session.umo;
+  main.append(name, umo);
+
+  const platformBadge = document.createElement("span");
+  platformBadge.className = "badge platform";
+  platformBadge.textContent = session.adapter || session.platform;
+  platformBadge.title = `平台实例：${session.platform}`;
+
+  const typeBadge = document.createElement("span");
+  typeBadge.className =
+    "badge " + (session.message_type === "GroupMessage" ? "group" : "private");
+  typeBadge.textContent = messageTypeLabel(session.message_type);
+
+  row.append(checkbox, main, platformBadge, typeBadge);
+  return row;
+}
+
 function renderSessions() {
   const list = $("session-list");
   const view = filteredSessions();
@@ -591,41 +641,11 @@ function renderSessions() {
   } else {
     const fragment = document.createDocumentFragment();
     view.slice(0, MAX_RENDER_ROWS).forEach((session) => {
-      const isSelected = targets.has(session.umo);
-
-      const row = document.createElement("div");
-      row.className = "session-row";
-      row.dataset.umo = session.umo;
-
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = isSelected;
-      checkbox.addEventListener("change", () => {
-        toggleInclude(session.umo, checkbox.checked);
-      });
-
-      const main = document.createElement("div");
-      main.className = "main";
-      const name = document.createElement("div");
-      name.className = "name";
-      name.textContent = session.display_name || session.session_id;
-      const umo = document.createElement("span");
-      umo.className = "umo";
-      umo.textContent = session.umo;
-      main.append(name, umo);
-
-      const platformBadge = document.createElement("span");
-      platformBadge.className = "badge platform";
-      platformBadge.textContent = session.adapter || session.platform;
-      platformBadge.title = `平台实例：${session.platform}`;
-
-      const typeBadge = document.createElement("span");
-      typeBadge.className =
-        "badge " + (session.message_type === "GroupMessage" ? "group" : "private");
-      typeBadge.textContent = messageTypeLabel(session.message_type);
-
-      row.append(checkbox, main, platformBadge, typeBadge);
-      fragment.appendChild(row);
+      fragment.appendChild(
+        buildSessionRow(session, targets.has(session.umo), (checked) => {
+          toggleInclude(session.umo, checked);
+        })
+      );
     });
     list.appendChild(fragment);
   }
@@ -638,6 +658,268 @@ function renderSessions() {
   renderModeBanner();
   renderOverview();
   updateSaveSummary();
+  renderManual();
+}
+
+/* ------------------------------------------------------------------ */
+/* 手动广播（仅网页控制台，单次目标不改动保存的勾选）                  */
+/* ------------------------------------------------------------------ */
+function manualTargets() {
+  if (state.manual.mode === "follow") return [...targetSet()];
+  return [...state.manual.targets];
+}
+
+function manualCandidates() {
+  const keyword = state.manual.q.trim().toLowerCase();
+  if (!keyword) return state.sessions;
+  return state.sessions.filter(
+    (session) =>
+      session.umo.toLowerCase().includes(keyword) ||
+      String(session.display_name || "").toLowerCase().includes(keyword) ||
+      String(session.session_id || "").toLowerCase().includes(keyword)
+  );
+}
+
+function toggleManualTarget(umo, checked) {
+  if (checked) state.manual.targets.add(umo);
+  else state.manual.targets.delete(umo);
+  renderManual();
+}
+
+function renderManualPicker() {
+  const list = $("manual-list");
+  const view = manualCandidates();
+  list.innerHTML = "";
+
+  if (!view.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = state.sessions.length
+      ? "没有符合搜索条件的会话。"
+      : "尚未发现任何会话，先到「目标会话」里刷新列表。";
+    list.appendChild(empty);
+  } else {
+    const fragment = document.createDocumentFragment();
+    view.slice(0, MAX_RENDER_ROWS).forEach((session) => {
+      fragment.appendChild(
+        buildSessionRow(
+          session,
+          state.manual.targets.has(session.umo),
+          (checked) => toggleManualTarget(session.umo, checked)
+        )
+      );
+    });
+    list.appendChild(fragment);
+  }
+
+  const shown = Math.min(view.length, MAX_RENDER_ROWS);
+  $("manual-list-count").textContent =
+    `显示 ${shown} / 筛选 ${view.length} / 本次已选 ${state.manual.targets.size}` +
+    (view.length > MAX_RENDER_ROWS ? "（请用搜索缩小范围）" : "");
+}
+
+function manualResultLines(job) {
+  const result = job.result || {};
+  const lines = [
+    `✅ 已发送到 ${result.total ?? 0} 个会话：成功 ${result.success ?? 0}，失败 ${
+      result.failed ?? 0
+    }` +
+      (result.skipped ? `，跳过 ${result.skipped}` : "") +
+      (result.duration ? `，耗时 ${Number(result.duration).toFixed(1)} 秒` : ""),
+  ];
+  if (result.missing_targets && result.missing_targets.length) {
+    lines.push(
+      `⚠️ ${result.missing_targets.length} 个目标未在会话列表中发现，已按 UMO 直接尝试发送`
+    );
+  }
+  const failures = result.failures || [];
+  if (failures.length) {
+    lines.push("失败明细：");
+    failures.slice(0, 5).forEach((item) => {
+      lines.push(`· ${item.umo} → ${item.reason}`);
+    });
+    if (failures.length > 5) lines.push(`…… 另有 ${failures.length - 5} 条未显示`);
+  }
+  return lines;
+}
+
+function renderManual() {
+  if (!$("manual-banner")) return;
+  const m = state.manual;
+  const count = manualTargets().length;
+  const targets = targetSet();
+  const text = $("manual-message").value;
+
+  $("manual-counter").textContent = `${text.length} / 4000 字`;
+  document.querySelectorAll("#manual-mode button").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.mode === m.mode);
+  });
+  $("manual-picker").classList.toggle("hidden", m.mode !== "custom");
+  $("manual-mode-hint").textContent =
+    m.mode === "follow"
+      ? `沿用「目标会话」的勾选结果（${targets.size} 个）`
+      : `本次单独选择（${m.targets.size} 个），不写回配置`;
+  if (m.mode === "custom") renderManualPicker();
+
+  const job = m.job;
+  const running = Boolean(job && job.state === "running");
+  const banner = $("manual-banner");
+  if (running) {
+    banner.className = "banner";
+    banner.textContent = `⏳ 正在发送 ${job.done || 0} / ${job.total || count} …`;
+  } else if (job && job.state === "done") {
+    const result = job.result || {};
+    banner.className = "banner " + (result.failed ? "warn" : "ok");
+    banner.textContent = manualResultLines(job).join("\n");
+  } else if (job && job.state === "failed") {
+    banner.className = "banner warn";
+    banner.textContent = `❌ 本次发送未完成：${job.error || "未知原因"}`;
+  } else if (!count) {
+    banner.className = "banner warn";
+    banner.textContent =
+      m.mode === "follow"
+        ? "「目标会话」里还没有勾选任何会话：先在下方勾选，或切换到「本次自定义」临时挑选。"
+        : "本次还没有选择任何会话。";
+  } else if (state.overview?.busy) {
+    banner.className = "banner warn";
+    banner.textContent = "当前有广播任务正在执行，等它结束后才能发送。";
+  } else {
+    const left = state.overview?.quota_left;
+    const quota =
+      typeof left === "number" && left >= 0 ? `今日剩余额度 ${left} 条。` : "";
+    banner.className = "banner ok";
+    banner.textContent = `本次将发送到 ${count} 个会话。${quota}`;
+  }
+
+  const disabled =
+    m.sending ||
+    running ||
+    Boolean(state.overview?.busy) ||
+    count === 0 ||
+    !text.trim();
+  const button = $("manual-send");
+  button.disabled = disabled;
+  button.textContent = m.sending || running
+    ? "发送中…"
+    : m.armed
+      ? `确认发送到 ${count} 个会话`
+      : `发送到 ${count} 个会话`;
+
+  $("manual-status").textContent = m.sending || running
+    ? "正在逐条发送，请保持页面打开；也可以关掉页面，发送会继续。"
+    : m.armed
+      ? `再点一次按钮确认：消息会立即发往 ${count} 个会话。`
+      : "";
+}
+
+async function refreshOverviewLight() {
+  try {
+    const data = await api.get(PLUGIN_ENDPOINT.get);
+    state.overview = data.overview || state.overview;
+    state.sessions = data.sessions || state.sessions;
+    state.platforms = data.platforms || state.platforms;
+    state.messageTypes = data.message_types || state.messageTypes;
+    renderFilters();
+    renderSessions();
+    renderLastResult();
+  } catch (error) {
+    /* 概览刷新失败不影响主流程 */
+  }
+}
+
+function watchJob(jobId) {
+  const m = state.manual;
+  if (!jobId || m.watchingId === jobId) return;
+  m.watchingId = jobId;
+  window.clearTimeout(m.pollTimer);
+
+  const tick = async () => {
+    let job = null;
+    try {
+      job = await api.get(PLUGIN_ENDPOINT.job);
+    } catch (error) {
+      m.sending = false;
+      m.watchingId = "";
+      m.job = {
+        ...(m.job || {}),
+        state: "failed",
+        error: `查询进度失败：${error.message || error}（发送可能仍在继续，可刷新页面查看）`,
+      };
+      renderManual();
+      toast(`查询发送进度失败：${error.message || error}`, true);
+      return;
+    }
+    if (!job || job.id !== jobId) {
+      m.sending = false;
+      m.watchingId = "";
+      if (!job || job.state === "idle") {
+        m.job = { state: "failed", error: "任务状态已丢失（插件可能被重载），请重新发送" };
+      }
+      renderManual();
+      return;
+    }
+    m.job = job;
+    if (job.state === "running") {
+      m.sending = true;
+      renderManual();
+      m.pollTimer = window.setTimeout(tick, JOB_POLL_INTERVAL);
+      return;
+    }
+    m.sending = false;
+    m.watchingId = "";
+    renderManual();
+    const done = job.state === "done";
+    toast(
+      done ? "广播发送完成，结果见提示条" : `广播未完成：${job.error || "未知原因"}`,
+      !done
+    );
+    refreshOverviewLight();
+  };
+
+  m.pollTimer = window.setTimeout(tick, 800);
+}
+
+async function sendManual() {
+  const m = state.manual;
+  if (m.sending) return;
+  const message = $("manual-message").value.trim();
+  if (!message) {
+    toast("请先填写消息内容", true);
+    return;
+  }
+  const targets = manualTargets();
+  if (!targets.length) {
+    toast("本次没有目标会话", true);
+    return;
+  }
+  if (!m.armed) {
+    m.armed = true;
+    window.clearTimeout(m.armTimer);
+    m.armTimer = window.setTimeout(() => {
+      m.armed = false;
+      renderManual();
+    }, ARM_TIMEOUT);
+    renderManual();
+    toast(`将发往 ${targets.length} 个会话，再点一次按钮确认`);
+    return;
+  }
+
+  m.armed = false;
+  window.clearTimeout(m.armTimer);
+  m.sending = true;
+  m.job = null;
+  renderManual();
+  try {
+    const job = await api.post(PLUGIN_ENDPOINT.send, { message, targets });
+    m.job = job;
+    m.watchingId = "";
+    renderManual();
+    watchJob(job.id);
+  } catch (error) {
+    m.sending = false;
+    renderManual();
+    toast(`发送失败：${error.message || error}`, true);
+  }
 }
 
 function renderLastResult() {
@@ -799,6 +1081,16 @@ function applyPayload(data) {
   state.runtime = Object.fromEntries(
     (state.overview?.schedules || []).map((item) => [item.id, item])
   );
+
+  const job = state.overview?.web_job;
+  if (job && job.state && job.state !== "idle") {
+    state.manual.job = job;
+    if (job.state === "running") {
+      state.manual.sending = true;
+      watchJob(job.id);
+    }
+  }
+
   renderAll();
 }
 
@@ -852,6 +1144,38 @@ function bindEvents() {
     }
     renderModeBanner();
   });
+
+  /* 手动广播 */
+  $("manual-message").addEventListener("input", renderManual);
+  $("manual-search").addEventListener("input", () => {
+    state.manual.q = $("manual-search").value;
+    renderManualPicker();
+  });
+  document.querySelectorAll("#manual-mode button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const mode = btn.dataset.mode;
+      state.manual.mode = mode;
+      if (mode === "custom" && state.manual.targets.size === 0) {
+        state.manual.targets = targetSet();
+      }
+      state.manual.armed = false;
+      renderManual();
+    });
+  });
+  $("manual-select-all").addEventListener("click", () => {
+    manualCandidates().forEach((session) => state.manual.targets.add(session.umo));
+    renderManual();
+  });
+  $("manual-clear").addEventListener("click", () => {
+    state.manual.targets = new Set();
+    renderManual();
+  });
+  $("manual-reset").addEventListener("click", () => {
+    state.manual.targets = targetSet();
+    renderManual();
+    toast(`已按当前勾选重置为 ${state.manual.targets.size} 个会话`);
+  });
+  $("manual-send").addEventListener("click", sendManual);
 
   ["send-interval", "max-per-minute", "daily-limit"].forEach((id) => {
     $(id).addEventListener("input", () => {

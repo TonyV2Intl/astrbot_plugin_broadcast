@@ -513,8 +513,14 @@
 
       /* 混排 <strong> 的提示条按普通文本流排版，避免 flex 拆行 */
       #mode-banner,
-      #last-result {
+      #last-result,
+      #manual-banner {
         display: block;
+      }
+
+      /* 手动广播的结果常有多行（失败明细），按换行渲染 */
+      #manual-banner {
+        white-space: pre-line;
       }
 
       .banner strong {
@@ -540,6 +546,10 @@
         overflow: hidden;
         max-height: 460px;
         overflow-y: auto;
+      }
+
+      .session-list.compact {
+        max-height: 300px;
       }
 
       .session-row {
@@ -763,7 +773,7 @@
       <header class="top">
         <div>
           <h1>广播配置</h1>
-          <p class="subtitle">目标会话、定时计划与发送节奏都在这里集中管理</p>
+          <p class="subtitle">手动发送、定时计划、目标会话与发送节奏都在这里集中管理</p>
         </div>
       </header>
 
@@ -790,6 +800,59 @@
             </div>
           </div>
           <div id="runtime-banner" class="banner hidden"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <h2>手动广播</h2>
+              <p class="desc">
+                立即把一条消息发出去。默认发给「目标会话」里已勾选的会话；
+                「本次自定义」可以临时增减目标，只对这一次生效，不会改动保存的勾选。
+              </p>
+            </div>
+          </div>
+
+          <div class="field" style="margin-bottom: 14px">
+            <label for="manual-message">消息内容</label>
+            <textarea
+              id="manual-message"
+              maxlength="4000"
+              placeholder="例如：今晚 20:00 例行维护，预计 10 分钟，请提前保存工作。"
+            ></textarea>
+            <span class="hint" id="manual-counter">0 / 4000 字</span>
+          </div>
+
+          <div class="toggle-row">
+            <div class="seg" id="manual-mode">
+              <button type="button" data-mode="follow" class="active">跟随已勾选</button>
+              <button type="button" data-mode="custom">本次自定义</button>
+            </div>
+            <span class="hint" id="manual-mode-hint">—</span>
+          </div>
+
+          <div id="manual-picker" class="hidden">
+            <div class="toolbar">
+              <div class="grow">
+                <input type="text" id="manual-search" placeholder="搜索群名、会话 ID 或 UMO" />
+              </div>
+              <button type="button" class="btn" id="manual-select-all">全选当前筛选</button>
+              <button type="button" class="btn" id="manual-clear">清空</button>
+              <button type="button" class="btn" id="manual-reset">按已勾选重置</button>
+            </div>
+            <div class="session-list compact" id="manual-list"></div>
+            <div class="list-foot">
+              <span id="manual-list-count">—</span>
+              <span>这里的勾选只影响这一次发送</span>
+            </div>
+          </div>
+
+          <div id="manual-banner" class="banner">—</div>
+
+          <div class="toolbar" style="margin-bottom: 0">
+            <button type="button" class="btn primary" id="manual-send">发送</button>
+            <span class="hint" id="manual-status"></span>
+          </div>
         </section>
 
         <section class="card">

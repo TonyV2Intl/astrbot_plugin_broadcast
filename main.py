@@ -16,7 +16,6 @@
     /broadcast_list         查看已发现的会话
     /broadcast_reload       重载配置并重建定时任务
     /broadcast_auth <UID>   把指定 UID 添加为广播管理员（管理员/超管）
-    /broadcast_whoami       查看自己的 UID 与广播权限（任何人可用）
 
 说明：
     广播目标不再局限于群聊。插件会综合三处来源发现会话：
@@ -120,10 +119,9 @@ _IDENTITY_KEYS = (
 AUTH_USAGE = (
     "用法：/broadcast_auth <UID> [UID2 ...]\n"
     "例：/broadcast_auth 123456789\n\n"
-    "UID 获取方式（推荐，不会拿错）：让目标用户发送 /broadcast_whoami，"
-    "把回执里的「UID」整串发给你。\n"
-    "也可以看 AstrBot 日志里「昵称/UID」的后半段，"
-    "或在插件配置页的「管理员 UID」里手动填写。"
+    "UID 获取方式：让目标用户在群里发一条消息，AstrBot 日志会打印"
+    "「昵称/UID」，后半段那串就是；"
+    "也可以在插件配置页的「管理员 UID」里手动填写。"
 )
 
 
@@ -567,6 +565,8 @@ class OfficialBroadcastPlugin(Star):
         self._scheduler: Any = None
         self._schedule_error = ""
         self._task_errors: dict[str, str] = {}
+        #: 网页控制台「手动广播」的最近一次任务快照（含进度），供前端轮询。
+        self._web_job: dict[str, Any] = {}
 
         self._load_settings()
         self._load_state()
@@ -986,9 +986,16 @@ class OfficialBroadcastPlugin(Star):
         return added
 
     async def _resolve_targets(
-        self, settings: Settings, refresh: bool = False
+        self,
+        settings: Settings,
+        refresh: bool = False,
+        umos: list[str] | None = None,
     ) -> tuple[list[SessionInfo], list[str]]:
-        """返回 (实际发送目标, 已知会话中找不到的 UMO)。"""
+        """返回 (实际发送目标, 已知会话中找不到的 UMO)。
+
+        ``umos`` 为空时使用配置里已勾选的目标；传入列表则只按该列表发送，
+        用于网页控制台的「本次自定义」——不影响 ``settings.target_umos``。
+        """
         sessions = await self._collect_sessions(refresh=refresh)
         self._adopt_sessions(sessions)
         settings = self._settings
@@ -996,7 +1003,7 @@ class OfficialBroadcastPlugin(Star):
 
         targets: list[SessionInfo] = []
         missing: list[str] = []
-        for umo in settings.target_umos:
+        for umo in list(settings.target_umos if umos is None else umos):
             info = index.get(umo)
             if info is None:
                 platform, message_type, session_id = _split_umo(umo)
@@ -1059,9 +1066,19 @@ class OfficialBroadcastPlugin(Star):
         return True, ""
 
     async def do_broadcast(
-        self, message: str, *, origin_umo: str = "", source: str = "manual"
+        self,
+        message: str,
+        *,
+        origin_umo: str = "",
+        source: str = "manual",
+        umos: list[str] | None = None,
+        progress: Any = None,
     ) -> BroadcastResult | None:
-        """执行一次广播。已有任务在跑时返回 None。"""
+        """执行一次广播。已有任务在跑时返回 None。
+
+        ``umos`` 指定本次发送目标（网页控制台的单次自定义），缺省用已勾选目标；
+        ``progress(done, total)`` 每发完一条回调一次，供前端显示进度。
+        """
         if self._busy:
             return None
 
@@ -1075,7 +1092,7 @@ class OfficialBroadcastPlugin(Star):
         result = BroadcastResult(source=source)
         try:
             settings = self._settings
-            targets, missing = await self._resolve_targets(settings)
+            targets, missing = await self._resolve_targets(settings, umos=umos)
             result.total = len(targets)
             result.missing_targets = missing
             if not targets:
@@ -1103,6 +1120,12 @@ class OfficialBroadcastPlugin(Star):
                     result.failed += 1
                     result.failures.append((session.umo, reason))
                     logger.warning(f"[broadcast] 发送失败 {session.umo}：{reason}")
+
+                if progress is not None:
+                    try:
+                        progress(index + 1, len(targets))
+                    except Exception:
+                        logger.debug("[broadcast] 进度回调出错", exc_info=True)
 
                 if interval > 0 and index < len(targets) - 1:
                     await asyncio.sleep(interval)
@@ -1389,6 +1412,18 @@ class OfficialBroadcastPlugin(Star):
                 ["POST"],
                 "刷新会话列表",
             ),
+            (
+                f"/{PLUGIN_NAME}/broadcast/send",
+                self.api_broadcast_send,
+                ["POST"],
+                "立即发送一条广播",
+            ),
+            (
+                f"/{PLUGIN_NAME}/broadcast/job",
+                self.api_broadcast_job,
+                ["GET"],
+                "查询手动广播进度",
+            ),
         )
         for route, handler, methods, desc in routes:
             try:
@@ -1414,6 +1449,7 @@ class OfficialBroadcastPlugin(Star):
             "last_result": self._state.get("last_result"),
             "scheduler_available": SCHEDULER_AVAILABLE,
             "aiocqhttp": [pid for pid, _ in self._aiocqhttp_instances()],
+            "web_job": self._web_job_snapshot(),
         }
 
     async def _api_payload(self) -> dict[str, Any]:
@@ -1489,6 +1525,132 @@ class OfficialBroadcastPlugin(Star):
                 "overview": self._overview(),
             }
         )
+
+    # ------------------------------------------------------------------ #
+    # Web API · 手动广播
+    # ------------------------------------------------------------------ #
+    def _web_job_snapshot(self) -> dict[str, Any]:
+        """返回最近一次网页手动广播的任务快照，没有则 state=idle。"""
+        if not self._web_job:
+            return {"state": "idle"}
+        return dict(self._web_job, busy=self._busy)
+
+    def _update_web_job(self, job_id: str, **fields: Any) -> None:
+        """只在任务仍是当次任务时更新，避免旧任务的回调覆盖新任务。"""
+        if self._web_job.get("id") != job_id:
+            return
+        self._web_job.update(fields)
+
+    def _start_web_broadcast(self, message: str, umos: list[str]) -> dict[str, Any]:
+        """后台启动一次手动广播，立即返回任务快照（不阻塞 HTTP 请求）。"""
+        job_id = secrets.token_hex(4)
+        self._web_job = {
+            "id": job_id,
+            "state": "running",
+            "total": len(umos),
+            "done": 0,
+            "message_length": len(message),
+            "started": datetime.now(self._tz()).isoformat(timespec="seconds"),
+            "result": None,
+            "error": "",
+        }
+        self._task = asyncio.create_task(self._run_web_broadcast(job_id, message, umos))
+        return self._web_job_snapshot()
+
+    async def _run_web_broadcast(
+        self, job_id: str, message: str, umos: list[str]
+    ) -> None:
+        def progress(done: int, total: int) -> None:
+            self._update_web_job(job_id, done=done, total=total)
+
+        try:
+            result = await self.do_broadcast(
+                message, source="web", umos=umos, progress=progress
+            )
+        except asyncio.CancelledError:
+            self._update_web_job(
+                job_id, state="failed", error="任务被中断（插件重载？）"
+            )
+            raise
+        except Exception as exc:
+            logger.exception("[broadcast] 网页手动广播异常")
+            self._update_web_job(
+                job_id, state="failed", error=f"{type(exc).__name__}: {exc}"
+            )
+            return
+
+        if result is None:
+            self._update_web_job(
+                job_id, state="failed", error="已有广播任务在执行，本次未发送"
+            )
+            return
+        self._update_web_job(job_id, state="done", result=result.to_dict())
+
+    async def api_broadcast_send(self):
+        """POST broadcast/send：立即向指定会话发一条消息。
+
+        请求体：``{"message": str, "targets": [UMO, ...]}``。
+        ``targets`` 缺省时使用已勾选的目标；传入则只发给这些会话，
+        而且**不会**写回配置——单次自定义不改变长期的勾选状态。
+        """
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象")
+
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            return error_response("消息内容不能为空")
+        if len(message) > MAX_MESSAGE_LENGTH:
+            return error_response(f"消息过长，请控制在 {MAX_MESSAGE_LENGTH} 字以内")
+
+        raw_targets = payload.get("targets")
+        if raw_targets is None:
+            umos = list(dict.fromkeys(self._settings.target_umos))
+        elif isinstance(raw_targets, list):
+            umos = []
+            invalid: list[str] = []
+            for item in raw_targets:
+                umo = str(item or "").strip()
+                if not umo:
+                    continue
+                if not _UMO_RE.match(umo):
+                    invalid.append(umo)
+                    continue
+                if umo not in umos:
+                    umos.append(umo)
+            if invalid:
+                return error_response(
+                    "目标会话格式不对（应为「平台:消息类型:会话ID」）："
+                    + "、".join(invalid[:3])
+                )
+        else:
+            return error_response("targets 必须是会话 UMO 数组")
+
+        if not umos:
+            return error_response("本次没有可发送的会话，请至少勾选一个")
+
+        limit = self._settings.daily_limit
+        used = self._quota_used()
+        if limit > 0 and used >= limit:
+            return error_response(
+                f"今日主动消息额度已用尽（{used}/{limit}），请明天再试或调整每日额度",
+                status_code=429,
+            )
+
+        if self._busy or self._web_job.get("state") == "running":
+            return error_response(
+                "已有广播任务在执行，请等待完成后再发送", status_code=409
+            )
+
+        job = self._start_web_broadcast(message, umos)
+        logger.info(
+            f"[broadcast] 网页手动广播：目标 {len(umos)} 个，正文 {len(message)} 字"
+        )
+        return json_response(job)
+
+    async def api_broadcast_job(self):
+        """GET broadcast/job：返回最近一次网页手动广播的进度与结果。"""
+        return json_response(self._web_job_snapshot())
 
     # ------------------------------------------------------------------ #
     # 指令
@@ -1688,42 +1850,6 @@ class OfficialBroadcastPlugin(Star):
                 "⚠️ 但当前一个会话都没勾选，正式广播不会发送。"
             )
 
-    @filter.command("broadcast_whoami")
-    async def broadcast_whoami(self, event: AstrMessageEvent):
-        """查看自己的 UID 与广播权限，排查「授权了却不生效」。
-
-        任何人都能执行：它只回显自己的身份，不泄露名单内容
-        （非管理员只看到管理员总数）。
-        """
-        ids = self._identity_ids(event)
-        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
-        platform = self._platform_name(event) or _split_umo(umo)[0] or "未知"
-        admin = self._is_admin(event)
-
-        lines = ["🪪 你的身份信息"]
-        lines.append(f"UID：{ids[0] if ids else '（平台未提供）'}")
-        if len(ids) > 1:
-            lines.append("其他身份：" + "、".join(ids[1:]))
-        lines.append(f"平台：{platform}｜会话：{umo or '未知'}")
-        lines.append(f"广播权限：{'✅ 是管理员' if admin else '❌ 不在管理员名单'}")
-
-        if admin:
-            listed = self._settings.admin_uids
-            lines.append(f"管理员名单：{len(listed)} 个")
-            if listed:
-                lines.append("· " + "、".join(listed[:20]))
-                if len(listed) > 20:
-                    lines.append(f"…… 其余 {len(listed) - 20} 个见配置页")
-        else:
-            lines.append("请让管理员执行下面任意一条（命中一个即可）：")
-            for ident in (ids or ["<你的 UID>"])[:3]:
-                lines.append(f"  /broadcast_auth {ident}")
-            lines.append(
-                "提示：QQ 官方机器人在群聊与私聊、不同群之间下发的 UID "
-                "可能并不相同，在哪个场景用就在哪个场景查一次。"
-            )
-        yield event.plain_result("\n".join(lines))
-
     @filter.command("broadcast_reload")
     async def broadcast_reload(self, event: AstrMessageEvent):
         """重载配置并重建定时任务。"""
@@ -1768,7 +1894,8 @@ class OfficialBroadcastPlugin(Star):
                 f"⚠️ 这是会话 UMO，不是用户 UID：{'、'.join(umo_like)}\n"
                 "UMO 形如「平台:消息类型:会话ID」，用来指定广播目标；"
                 "管理员要填的是消息发送者的 UID。\n"
-                "让对方发一条 /broadcast_whoami 就能拿到。\n\n" + AUTH_USAGE
+                "让对方发一条消息，从 AstrBot 日志「昵称/UID」的后半段复制即可。\n\n"
+                + AUTH_USAGE
             )
             return
 
@@ -1821,12 +1948,12 @@ class OfficialBroadcastPlugin(Star):
                     "⚠️ 这些看起来是 QQ 号："
                     + "、".join(numeric)
                     + "\nQQ 官方机器人一般只下发 openid（一串字母数字），"
-                    "填 QQ 号大概率匹配不上；请用 /broadcast_whoami 里给出的值。"
+                    "填 QQ 号大概率匹配不上；请填日志里 openid 那一串。"
                 )
         if added:
             lines.append(
-                "对方仍提示权限不足时：让其在要用的那个会话里发送 "
-                "/broadcast_whoami，把回执中的 UID 发给你再授权一次。"
+                "对方仍提示权限不足时：让其在要用的那个会话里发一条消息，"
+                "把 AstrBot 日志「昵称/UID」的后半段发给你，再授权一次。"
             )
         yield event.plain_result("\n".join(lines))
 
@@ -1963,7 +2090,7 @@ class OfficialBroadcastPlugin(Star):
                 )
         if ids:
             lines.append(f"让管理员执行：/broadcast_auth {primary}")
-        lines.append("发送 /broadcast_whoami 可查看完整身份与授权方式。")
+        lines.append("也可以让管理员在插件配置页的「管理员 UID」里手动添加。")
         return "\n".join(lines)
 
     def _is_super_admin(self, event: AstrMessageEvent) -> bool:
