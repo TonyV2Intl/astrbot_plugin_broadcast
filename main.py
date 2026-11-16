@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import json
 import os
 import re
@@ -136,6 +137,22 @@ def _strip_command(text: str, command: str) -> str:
     raw = str(text or "").lstrip()
     pattern = rf"^/?\s*{re.escape(command)}(?=\s|$)\s*"
     return re.sub(pattern, "", raw, count=1, flags=re.IGNORECASE | re.DOTALL)
+
+
+def _mask_uid(uid: str, keep: int = 4) -> str:
+    """打码显示 UID，避免在群里回执里完整暴露别人的 openid。"""
+    if len(uid) <= keep * 2:
+        return uid
+    return f"{uid[:keep]}***{uid[-keep:]}"
+
+
+def _first_diff_pos(left: str, right: str) -> int:
+    """两个字符串从第几个字符（1 起）开始不同。"""
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if left[index] != right[index]:
+            return index + 1
+    return limit + 1
 
 
 class SettingsError(ValueError):
@@ -1688,6 +1705,16 @@ class OfficialBroadcastPlugin(Star):
             )
             return
 
+        umo_like = [token for token in tokens if _UMO_RE.match(token)]
+        if umo_like:
+            yield event.plain_result(
+                f"⚠️ 这是会话 UMO，不是用户 UID：{'、'.join(umo_like)}\n"
+                "UMO 形如「平台:消息类型:会话ID」，用来指定广播目标；"
+                "管理员要填的是消息发送者的 UID。\n"
+                "让对方发一条 /broadcast_whoami 就能拿到。\n\n" + AUTH_USAGE
+            )
+            return
+
         invalid = [token for token in tokens if not _ADMIN_UID_RE.match(token)]
         if invalid:
             yield event.plain_result(
@@ -1706,6 +1733,12 @@ class OfficialBroadcastPlugin(Star):
                 admins.append(uid)
                 added.append(uid)
 
+        suspects: list[tuple[str, str, float, int]] = []
+        for uid in added:
+            hit = self._similar_admin(uid)
+            if hit and hit[1] >= 0.9:
+                suspects.append((uid, *hit))
+
         if added:
             self._settings.admin_uids = admins
             self._save_settings()
@@ -1715,6 +1748,13 @@ class OfficialBroadcastPlugin(Star):
         lines += [f"ℹ️ {uid}：该用户已经是管理员了" for uid in existed]
         if added:
             lines.append(f"当前管理员共 {len(self._settings.admin_uids)} 个")
+
+        for uid, near, ratio, pos in suspects:
+            lines.append(
+                f"💡 {_mask_uid(uid)} 与名单里已有的 {_mask_uid(near)} 高度相似"
+                f"（{ratio:.0%} 相同，从第 {pos} 个字符起不同）——"
+                "确认不是同一个人的抄写差异？"
+            )
 
         platform = self._platform_name(event)
         if added and platform.startswith("qq_official"):
@@ -1818,6 +1858,22 @@ class OfficialBroadcastPlugin(Star):
                 hits.append(found)
         return hits
 
+    def _similar_admin(self, ident: str) -> tuple[str, float, int] | None:
+        """名单中与该身份高度相似的条目，返回 (条目, 相似度, 差异位置)。
+
+        相似度低于 0.85 不提示：正常的不同 ID 之间也可能撞脸，
+        阈值太低会变成噪音。这条提示专门用来抓「抄漏/抄错一个字符」。
+        """
+        best: tuple[str, float, int] | None = None
+        for raw in self._settings.admin_uids:
+            uid = raw.strip()
+            if not uid or uid == ident:
+                continue
+            ratio = difflib.SequenceMatcher(None, uid, ident).ratio()
+            if ratio >= 0.85 and (best is None or ratio > best[1]):
+                best = (uid, ratio, _first_diff_pos(uid, ident))
+        return best
+
     def _deny_text(self, event: AstrMessageEvent, scope: str = "该指令") -> str:
         """权限不足回执：把可用身份和下一步动作一起给出，省一轮来回。"""
         ids = self._identity_ids(event)
@@ -1839,6 +1895,15 @@ class OfficialBroadcastPlugin(Star):
                 + "、".join(near)
                 + "\n请把名单改成上面「你的 UID」的写法（大小写敏感）。"
             )
+        elif ids:
+            hit = self._similar_admin(ids[0])
+            if hit:
+                uid, ratio, pos = hit
+                lines.append(
+                    f"名单里有一条极相似的记录：{_mask_uid(uid)}"
+                    f"（{ratio:.0%} 相同，从第 {pos} 个字符起不同）——"
+                    "如果那就是你，说明当时抄漏或抄错了一个字符。"
+                )
         if ids:
             lines.append(f"让管理员执行：/broadcast_auth {primary}")
         lines.append("发送 /broadcast_whoami 可查看完整身份与授权方式。")
