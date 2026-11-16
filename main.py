@@ -582,6 +582,63 @@ class OfficialBroadcastPlugin(Star):
         except Exception:
             logger.exception("[broadcast] 初始化定时任务失败")
 
+    async def initialize(self) -> None:
+        """插件加载完成后放开框架层对本插件指令的权限拦截。"""
+        self._relax_framework_permissions()
+
+    # ------------------------------------------------------------------ #
+    # 基础工具
+    # ------------------------------------------------------------------ #
+    def _relax_framework_permissions(self) -> None:
+        """移除 AstrBot「指令权限」对本插件指令的拦截。
+
+        AstrBot 4.24 起可以在指令管理里给单条指令设权限，它用的是
+        **AstrBot 全局管理员**（``admins_id``），与本插件的
+        ``admin_uids`` 完全无关。一旦 ``broadcast`` 被设成「仅管理员」，
+        广播管理员会在进入 handler 之前就被框架拦下，回的是
+        「您(ID: xxx)的权限不足以使用此指令」——看起来像插件拒绝了，
+        其实是插件根本没收到事件。
+
+        本插件自己按 ``admin_uids`` + 超级管理员鉴权（无名单时只有
+        超级管理员可用），所以这里只清掉本模块 handler 上的
+        管理员类过滤器，不影响其他插件的配置。
+        """
+        try:
+            from astrbot.core.star.filter.permission import (
+                PermissionType,
+                PermissionTypeFilter,
+            )
+            from astrbot.core.star.star_handler import star_handlers_registry
+        except Exception:
+            return
+
+        blocked = {PermissionType.ADMIN, PermissionType.GROUP_ADMIN}
+        share = getattr(PermissionType, "SHARED_GROUP_ADMIN", None)
+        if share is not None:
+            blocked.add(share)
+
+        removed: list[str] = []
+        try:
+            handlers = star_handlers_registry.get_handlers_by_module_name(__name__)
+            for handler in handlers:
+                for filter_ref in list(handler.event_filters):
+                    if (
+                        isinstance(filter_ref, PermissionTypeFilter)
+                        and filter_ref.permission_type in blocked
+                    ):
+                        handler.event_filters.remove(filter_ref)
+                        removed.append(handler.handler_name)
+        except Exception:
+            logger.debug("[broadcast] 检查框架指令权限失败", exc_info=True)
+            return
+
+        if removed:
+            logger.warning(
+                "[broadcast] 以下指令被 AstrBot 设为「仅管理员」，"
+                "已改由插件自身鉴权（admin_uids + 超级管理员）："
+                + "、".join(dict.fromkeys(removed))
+            )
+
     # ------------------------------------------------------------------ #
     # 基础工具
     # ------------------------------------------------------------------ #
