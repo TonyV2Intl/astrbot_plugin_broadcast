@@ -16,6 +16,7 @@
     /broadcast_list         查看已发现的会话
     /broadcast_reload       重载配置并重建定时任务
     /broadcast_auth <UID>   把指定 UID 添加为广播管理员（管理员/超管）
+    /broadcast_whoami       查看自己的 UID 与广播权限（任何人可用）
 
 说明：
     广播目标不再局限于群聊。插件会综合三处来源发现会话：
@@ -31,6 +32,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -103,12 +105,24 @@ _ADMIN_UID_RE = re.compile(r"^[A-Za-z0-9_.:-]{4,80}$")
 # 参数分隔：空格、逗号、分号、顿号
 _ARG_SPLIT_RE = re.compile(r"[\s,，;；、]+")
 
+# 同一个人的身份在不同平台/场景下会落在不同字段：
+# QQ 官方群聊给 member_openid、私聊给 user_openid，另有跨场景的 union_openid；
+# 其余适配器一般只用 sender_id。授权时命中任意一个即视为同一人，
+# 这样在 A 群授权过的管理员到 B 群、私聊里也能认出来。
+_IDENTITY_KEYS = (
+    "union_openid",
+    "member_openid",
+    "user_openid",
+    "union_user_account",
+)
+
 AUTH_USAGE = (
     "用法：/broadcast_auth <UID> [UID2 ...]\n"
     "例：/broadcast_auth 123456789\n\n"
-    "UID 获取方式：让目标用户在群里发一条消息，"
-    "AstrBot 日志会打印「昵称/UID」，复制后半段即可。\n"
-    "也可以到插件配置页的「管理员 UID」里手动填写。"
+    "UID 获取方式（推荐，不会拿错）：让目标用户发送 /broadcast_whoami，"
+    "把回执里的「UID」整串发给你。\n"
+    "也可以看 AstrBot 日志里「昵称/UID」的后半段，"
+    "或在插件配置页的「管理员 UID」里手动填写。"
 )
 
 
@@ -1409,11 +1423,7 @@ class OfficialBroadcastPlugin(Star):
     async def broadcast(self, event: AstrMessageEvent):
         """向目标会话广播一条消息。"""
         if not self._is_admin(event):
-            yield event.plain_result(
-                "⚠️ 权限不足：仅管理员可使用广播指令。\n"
-                f"你的 UID：{self._sender_id(event) or '未知'}\n"
-                "可在插件配置页把它加入管理员列表。"
-            )
+            yield event.plain_result(self._deny_text(event, "广播指令"))
             return
 
         message = self._payload(event)
@@ -1488,7 +1498,7 @@ class OfficialBroadcastPlugin(Star):
     async def broadcast_status(self, event: AstrMessageEvent):
         """查看广播运行状态。"""
         if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
+            yield event.plain_result(self._deny_text(event))
             return
 
         settings = self._settings
@@ -1534,7 +1544,7 @@ class OfficialBroadcastPlugin(Star):
     async def broadcast_list(self, event: AstrMessageEvent):
         """列出已发现的会话。"""
         if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
+            yield event.plain_result(self._deny_text(event))
             return
 
         sessions = await self._collect_sessions()
@@ -1560,7 +1570,7 @@ class OfficialBroadcastPlugin(Star):
         不写入上次广播结果，纯粹用于在群里预览格式与可读性。
         """
         if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
+            yield event.plain_result(self._deny_text(event))
             return
 
         text = _strip_command(
@@ -1604,11 +1614,47 @@ class OfficialBroadcastPlugin(Star):
                 "⚠️ 但当前一个会话都没勾选，正式广播不会发送。"
             )
 
+    @filter.command("broadcast_whoami")
+    async def broadcast_whoami(self, event: AstrMessageEvent):
+        """查看自己的 UID 与广播权限，排查「授权了却不生效」。
+
+        任何人都能执行：它只回显自己的身份，不泄露名单内容
+        （非管理员只看到管理员总数）。
+        """
+        ids = self._identity_ids(event)
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        platform = self._platform_name(event) or _split_umo(umo)[0] or "未知"
+        admin = self._is_admin(event)
+
+        lines = ["🪪 你的身份信息"]
+        lines.append(f"UID：{ids[0] if ids else '（平台未提供）'}")
+        if len(ids) > 1:
+            lines.append("其他身份：" + "、".join(ids[1:]))
+        lines.append(f"平台：{platform}｜会话：{umo or '未知'}")
+        lines.append(f"广播权限：{'✅ 是管理员' if admin else '❌ 不在管理员名单'}")
+
+        if admin:
+            listed = self._settings.admin_uids
+            lines.append(f"管理员名单：{len(listed)} 个")
+            if listed:
+                lines.append("· " + "、".join(listed[:20]))
+                if len(listed) > 20:
+                    lines.append(f"…… 其余 {len(listed) - 20} 个见配置页")
+        else:
+            lines.append("请让管理员执行下面任意一条（命中一个即可）：")
+            for ident in (ids or ["<你的 UID>"])[:3]:
+                lines.append(f"  /broadcast_auth {ident}")
+            lines.append(
+                "提示：QQ 官方机器人在群聊与私聊、不同群之间下发的 UID "
+                "可能并不相同，在哪个场景用就在哪个场景查一次。"
+            )
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("broadcast_reload")
     async def broadcast_reload(self, event: AstrMessageEvent):
         """重载配置并重建定时任务。"""
         if not self._is_admin(event):
-            yield event.plain_result("⚠️ 权限不足：仅管理员可用。")
+            yield event.plain_result(self._deny_text(event))
             return
         self._load_settings()
         ok, message = self._reschedule()
@@ -1626,9 +1672,7 @@ class OfficialBroadcastPlugin(Star):
         自己才会进入消息链），因此这里改为直接接收 UID 文本。
         """
         if not self._is_admin(event):
-            yield event.plain_result(
-                "⚠️ 权限不足：仅广播管理员或 AstrBot 超级管理员可用。"
-            )
+            yield event.plain_result(self._deny_text(event, "授权指令"))
             return
 
         raw = _strip_command(getattr(event, "message_str", ""), "broadcast_auth")
@@ -1665,12 +1709,28 @@ class OfficialBroadcastPlugin(Star):
         if added:
             self._settings.admin_uids = admins
             self._save_settings()
-            logger.info(f"[broadcast] 新增 {len(added)} 个管理员")
+            logger.info(f"[broadcast] 新增 {len(added)} 个管理员：{'、'.join(added)}")
 
         lines = [f"✅ 已成功将 {uid} 添加为广播管理员" for uid in added]
         lines += [f"ℹ️ {uid}：该用户已经是管理员了" for uid in existed]
         if added:
             lines.append(f"当前管理员共 {len(self._settings.admin_uids)} 个")
+
+        platform = self._platform_name(event)
+        if added and platform.startswith("qq_official"):
+            numeric = [uid for uid in added if uid.isdigit()]
+            if numeric:
+                lines.append(
+                    "⚠️ 这些看起来是 QQ 号："
+                    + "、".join(numeric)
+                    + "\nQQ 官方机器人一般只下发 openid（一串字母数字），"
+                    "填 QQ 号大概率匹配不上；请用 /broadcast_whoami 里给出的值。"
+                )
+        if added:
+            lines.append(
+                "对方仍提示权限不足时：让其在要用的那个会话里发送 "
+                "/broadcast_whoami，把回执中的 UID 发给你再授权一次。"
+            )
         yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------ #
@@ -1683,6 +1743,58 @@ class OfficialBroadcastPlugin(Star):
         except Exception:
             return ""
 
+    @classmethod
+    def _identity_ids(cls, event: AstrMessageEvent) -> list[str]:
+        """收集这次消息里能代表发送者的全部标识（去重，首个是主 UID）。
+
+        平台之间字段不统一：``get_sender_id()`` 在 QQ 官方群聊给的是
+        ``member_openid``、私聊给的是 ``user_openid``，而官方还会下发
+        跨场景一致的 ``union_openid``（Webhook 适配器放在事件 extra 里，
+        WebSocket 适配器保留在 ``raw_message.raw_data.author`` 里）。
+        只要管理员名单命中其中任意一项，就认为有权限，避免「同一个
+        人在不同群里 openid 不同」导致授权失效。
+        """
+        ids: list[str] = []
+
+        def push(value: Any) -> None:
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                return
+            text = str(value).strip()
+            if text and text not in ids:
+                ids.append(text)
+
+        def harvest(holder: Any, depth: int = 0) -> None:
+            if holder is None or depth > 3:
+                return
+            if isinstance(holder, dict):
+                for key in _IDENTITY_KEYS:
+                    push(holder.get(key))
+                harvest(holder.get("author"), depth + 1)
+                harvest(holder.get("sender"), depth + 1)
+                return
+            for key in _IDENTITY_KEYS:
+                push(getattr(holder, key, None))
+            harvest(getattr(holder, "author", None), depth + 1)
+            harvest(getattr(holder, "sender", None), depth + 1)
+
+        push(cls._sender_id(event))
+        with contextlib.suppress(Exception):
+            harvest(event.get_extra())
+        message_obj = getattr(event, "message_obj", None)
+        harvest(getattr(message_obj, "sender", None))
+        raw = getattr(message_obj, "raw_message", None)
+        harvest(getattr(raw, "raw_data", None))
+        harvest(raw)
+        return ids
+
+    @staticmethod
+    def _platform_name(event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_platform_name() or "").strip()
+        except Exception:
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            return _split_umo(umo)[0]
+
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """广播管理员：名单内成员，或 AstrBot 超级管理员（始终保留权限）。
 
@@ -1691,8 +1803,46 @@ class OfficialBroadcastPlugin(Star):
         """
         if self._is_super_admin(event):
             return True
-        uid = self._sender_id(event)
-        return bool(uid) and uid in self._settings.admin_uids
+        admins = {uid.strip() for uid in self._settings.admin_uids if uid.strip()}
+        if not admins:
+            return False
+        return any(ident in admins for ident in self._identity_ids(event))
+
+    def _near_miss_admin(self, ids: list[str]) -> list[str]:
+        """名单里与本次身份只差大小写的条目（多半是手抄时大小写变了）。"""
+        listed = {uid.strip().lower(): uid.strip() for uid in self._settings.admin_uids}
+        hits: list[str] = []
+        for ident in ids:
+            found = listed.get(ident.lower())
+            if found and found != ident and found not in hits:
+                hits.append(found)
+        return hits
+
+    def _deny_text(self, event: AstrMessageEvent, scope: str = "该指令") -> str:
+        """权限不足回执：把可用身份和下一步动作一起给出，省一轮来回。"""
+        ids = self._identity_ids(event)
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        logger.info(
+            f"[broadcast] 权限拒绝（{scope}）：umo={umo or '未知'} "
+            f"身份={'、'.join(ids) or '空'} "
+            f"名单={'、'.join(self._settings.admin_uids) or '空'}"
+        )
+        primary = ids[0] if ids else "（平台未提供）"
+        lines = [f"⚠️ 权限不足：仅广播管理员或 AstrBot 超级管理员可使用{scope}。"]
+        lines.append(f"你的 UID：{primary}")
+        if len(ids) > 1:
+            lines.append("本次消息可用的其他身份：" + "、".join(ids[1:]))
+        near = self._near_miss_admin(ids)
+        if near:
+            lines.append(
+                "名单里有大小写不同的同一个 ID："
+                + "、".join(near)
+                + "\n请把名单改成上面「你的 UID」的写法（大小写敏感）。"
+            )
+        if ids:
+            lines.append(f"让管理员执行：/broadcast_auth {primary}")
+        lines.append("发送 /broadcast_whoami 可查看完整身份与授权方式。")
+        return "\n".join(lines)
 
     def _is_super_admin(self, event: AstrMessageEvent) -> bool:
         """AstrBot 全局管理员（事件 role == admin）。"""
